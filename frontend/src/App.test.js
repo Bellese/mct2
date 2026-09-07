@@ -13,7 +13,7 @@ import * as api from './api/client';
 jest.mock('./api/client');
 jest.mock('./pages/MeasuresPage', () => () => <div>Measures page</div>);
 jest.mock('./pages/JobsPage', () => () => <div>Jobs page</div>);
-jest.mock('./pages/GroupsPage', () => () => <div>Groups page</div>);
+jest.mock('./pages/PatientsPage', () => () => <div>Patients page</div>);
 jest.mock('./pages/ResultsPage', () => () => <div>Results page</div>);
 jest.mock('./pages/ValidationPage', () => () => <div>Validation page</div>);
 jest.mock('./pages/SettingsPage', () => () => <div>Settings page</div>);
@@ -38,7 +38,7 @@ function mockSettings({ validation = false, groups = false } = {}) {
 }
 
 describe('App — nav / title / search derivation from ROUTES', () => {
-  test('feature flags off: Groups and Validation are hidden, /jobs resolves its title and placeholder', async () => {
+  test('validation flag off: Validation is hidden but Patients is not, /jobs resolves its title and placeholder', async () => {
     mockSettings({ validation: false, groups: false });
 
     renderApp('/jobs');
@@ -48,7 +48,10 @@ describe('App — nav / title / search derivation from ROUTES', () => {
     expect(within(nav).getByRole('link', { name: /Measures/ })).toBeInTheDocument();
     expect(within(nav).getByRole('link', { name: /Jobs/ })).toBeInTheDocument();
     expect(within(nav).getByRole('link', { name: /Results/ })).toBeInTheDocument();
-    expect(within(nav).queryByRole('link', { name: /Groups/ })).not.toBeInTheDocument();
+    // Patients is always on — a participant surveying an unfamiliar CDR must
+    // not have to find an admin flag first (#404). groups_enabled now gates
+    // only the parked $evaluate backend.
+    expect(within(nav).getByRole('link', { name: /Patients/ })).toBeInTheDocument();
     expect(within(nav).queryByRole('link', { name: /Validation/ })).not.toBeInTheDocument();
 
     const header = screen.getByRole('banner');
@@ -56,17 +59,23 @@ describe('App — nav / title / search derivation from ROUTES', () => {
     expect(screen.getByPlaceholderText('Search jobs…')).toBeInTheDocument();
   });
 
-  test('feature flags on: Groups and Validation appear in nav, /groups resolves its title and placeholder', async () => {
+  test('/patients resolves its title and placeholder', async () => {
     mockSettings({ validation: true, groups: true });
 
-    renderApp('/groups');
+    renderApp('/patients');
     const nav = screen.getByRole('navigation', { name: 'Main navigation' });
-    await waitFor(() => expect(within(nav).getByRole('link', { name: /Groups/ })).toBeInTheDocument());
+    await waitFor(() => expect(within(nav).getByRole('link', { name: /Patients/ })).toBeInTheDocument());
     expect(within(nav).getByRole('link', { name: /Validation/ })).toBeInTheDocument();
 
     const header = screen.getByRole('banner');
-    expect(within(header).getByText('Groups')).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('Search groups…')).toBeInTheDocument();
+    expect(within(header).getByText('Patients')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Search patient groups…')).toBeInTheDocument();
+  });
+
+  test('/groups redirects to /patients so old bookmarks keep working', async () => {
+    mockSettings();
+    renderApp('/groups');
+    expect(await screen.findByText('Patients page')).toBeInTheDocument();
   });
 
   test('/ redirects to /measures', async () => {

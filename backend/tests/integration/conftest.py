@@ -481,9 +481,10 @@ async def integration_client(integration_session_factory):
     from httpx import ASGITransport, AsyncClient
 
     from app.db import get_session
-    from app.routes import health, jobs, measures, results, settings, validation
+    from app.routes import groups, health, jobs, measures, results, settings, validation
 
     test_app = FastAPI()
+    test_app.include_router(groups.router)
     test_app.include_router(health.router)
     test_app.include_router(jobs.router)
     test_app.include_router(measures.router)

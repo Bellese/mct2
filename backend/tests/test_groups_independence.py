@@ -1,9 +1,9 @@
-"""Static check (issue #322 acceptance criterion):
+"""Static check (issue #322 acceptance criterion, carried forward by #404):
 
-`app/routes/groups.py` and `frontend/src/pages/GroupsPage.js` must not import
-anything from the Measure pipeline. The new feature is architecturally
-independent — shared infra (fhir_client, dependencies, db) is allowed; job/
-measure/result modules are not.
+`app/routes/groups.py` and `frontend/src/pages/PatientsPage.js` must not import
+anything from the Measure pipeline. The module is architecturally independent —
+shared infra (fhir_client, dependencies, db) is allowed; job/measure/result
+modules are not. The frontend half of this check lives in PatientsPage.test.js.
 """
 
 from __future__ import annotations

@@ -365,3 +365,121 @@ async def test_health_measure_engine_id_present_without_mcs_row(client, mock_fhi
     me = resp.json()["measure_engine"]
     assert me["id"] == 0
     assert me["is_read_only"] is False
+
+
+# ---------------------------------------------------------------------------
+# cdr identity block (issue #404)
+#
+# Mirrors the measure_engine block above. Without `cdr.id` no React effect can
+# key on "the CDR changed", which is what leaves the Jobs patient-group
+# dropdown showing the previous CDR's Groups.
+# ---------------------------------------------------------------------------
+
+
+async def _activate_cdr(test_session, *, name: str, url: str, read_only: bool = False):
+    from sqlalchemy import update as sa_update
+
+    from app.models.config import AuthType, CDRConfig
+
+    await test_session.execute(sa_update(CDRConfig).values(is_active=False))
+    cfg = CDRConfig(
+        name=name,
+        cdr_url=url,
+        auth_type=AuthType.none,
+        is_active=True,
+        is_default=False,
+        is_read_only=read_only,
+    )
+    test_session.add(cfg)
+    await test_session.commit()
+    await test_session.refresh(cfg)
+    return cfg
+
+
+async def test_health_cdr_connected_includes_id(client, test_session, mock_fhir_metadata):
+    """The connected branch carries the CDR id, not just the name."""
+    cfg = await _activate_cdr(test_session, name="Attendee CDR", url="https://attendee-cdr.example.com/fhir")
+
+    mock_response = httpx.Response(200, json=mock_fhir_metadata)
+    with patch("app.routes.health.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(return_value=mock_response)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+        resp = await client.get("/health")
+
+    cdr = resp.json()["cdr"]
+    assert cdr["status"] == "connected"
+    assert cdr["id"] == cfg.id
+    assert cdr["name"] == "Attendee CDR"
+    assert cdr["is_read_only"] is False
+
+
+async def test_health_cdr_http_error_includes_id(client, test_session, mock_fhir_metadata):
+    """The non-200 branch carries the id too, so the frontend can always key on it."""
+    cfg = await _activate_cdr(test_session, name="Read Only CDR", url="https://ro-cdr.example.com/fhir", read_only=True)
+
+    me_response = httpx.Response(200, json=mock_fhir_metadata)
+    call_count = 0
+
+    async def mock_get(url, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        # First call is the measure engine, second is the CDR.
+        if call_count == 1:
+            return me_response
+        return httpx.Response(503, json={"resourceType": "OperationOutcome", "issue": []})
+
+    with patch("app.routes.health.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+        resp = await client.get("/health")
+
+    cdr = resp.json()["cdr"]
+    assert cdr["status"] == "disconnected"
+    assert cdr["id"] == cfg.id
+    assert cdr["is_read_only"] is True
+
+
+async def test_health_cdr_exception_includes_id(client, test_session, mock_fhir_metadata):
+    """The exception branch carries the id too."""
+    cfg = await _activate_cdr(test_session, name="Attendee CDR", url="https://attendee-cdr.example.com/fhir")
+
+    me_response = httpx.Response(200, json=mock_fhir_metadata)
+    call_count = 0
+
+    async def mock_get(url, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return me_response
+        raise httpx.ConnectError("Connection refused")
+
+    with patch("app.routes.health.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+        resp = await client.get("/health")
+
+    cdr = resp.json()["cdr"]
+    assert cdr["status"] == "disconnected"
+    assert cdr["id"] == cfg.id
+    assert cdr["name"] == "Attendee CDR"
+
+
+async def test_health_cdr_id_present_without_cdr_row(client, mock_fhir_metadata):
+    """No CDR row → the fallback context still yields an id (0) and a writable flag."""
+    mock_response = httpx.Response(200, json=mock_fhir_metadata)
+    with patch("app.routes.health.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(return_value=mock_response)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+        resp = await client.get("/health")
+
+    cdr = resp.json()["cdr"]
+    assert cdr["id"] == 0
+    assert cdr["is_read_only"] is False

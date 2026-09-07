@@ -11,13 +11,6 @@ async def _enable_groups(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_groups_404_when_feature_disabled(client: AsyncClient):
-    # Default is disabled.
-    resp = await client.get("/api/groups")
-    assert resp.status_code == 404
-
-
-@pytest.mark.asyncio
 async def test_list_groups_happy(client: AsyncClient):
     await _enable_groups(client)
     fake_groups = [
@@ -30,7 +23,7 @@ async def test_list_groups_happy(client: AsyncClient):
         }
     ]
     with patch(
-        "app.routes.groups.list_groups_with_expression",
+        "app.routes.groups.list_groups",
         new=AsyncMock(return_value=fake_groups),
     ):
         resp = await client.get("/api/groups")
@@ -42,7 +35,7 @@ async def test_list_groups_happy(client: AsyncClient):
 async def test_list_groups_502_when_cdr_unreachable(client: AsyncClient):
     await _enable_groups(client)
     with patch(
-        "app.routes.groups.list_groups_with_expression",
+        "app.routes.groups.list_groups",
         new=AsyncMock(side_effect=Exception("connection refused")),
     ):
         resp = await client.get("/api/groups")
@@ -153,3 +146,64 @@ async def test_group_id_rejects_dot_only_segments(client, bad_id):
     from app.routes.groups import _GROUP_ID_RE
 
     assert _GROUP_ID_RE.match(bad_id) is None
+
+
+# ---------------------------------------------------------------------------
+# Patients module: the list endpoint is ungated and unfiltered (issue #404)
+#
+# A connectathon participant pointing Lenny at their own CDR needs to see every
+# cohort on it, not only the CQL-evaluatable ones. $evaluate stays gated.
+# ---------------------------------------------------------------------------
+
+
+async def _set_groups_flag(client: AsyncClient, enabled: bool) -> None:
+    await client.put("/settings/admin", json={"groups_enabled": enabled})
+
+
+@pytest.mark.asyncio
+async def test_list_groups_200_when_feature_disabled(client: AsyncClient):
+    """The Patients list must work with groups_enabled false — it is always on."""
+    await _set_groups_flag(client, False)
+    with patch("app.routes.groups.list_groups", new=AsyncMock(return_value=[])):
+        resp = await client.get("/api/groups")
+    assert resp.status_code == 200
+    assert resp.json() == {"groups": []}
+
+
+@pytest.mark.asyncio
+async def test_list_groups_200_when_feature_enabled(client: AsyncClient):
+    """...and with the flag on, too. The flag no longer gates this endpoint at all."""
+    await _set_groups_flag(client, True)
+    with patch("app.routes.groups.list_groups", new=AsyncMock(return_value=[])):
+        resp = await client.get("/api/groups")
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_list_groups_returns_unfiltered_groups(client: AsyncClient):
+    """The endpoint serves list_groups (all Groups), not the CQL-filtered variant."""
+    all_groups = [
+        {"id": "g1", "name": "Plain Cohort", "type": "person", "member_count": 42, "quantity": None},
+        {"id": "g2", "name": "Characteristic Cohort", "type": "person", "member_count": 0, "quantity": 319},
+    ]
+    with patch("app.routes.groups.list_groups", new=AsyncMock(return_value=all_groups)) as mocked:
+        resp = await client.get("/api/groups")
+    assert resp.status_code == 200
+    assert resp.json() == {"groups": all_groups}
+    assert mocked.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_list_groups_502_when_cdr_unreachable_ungated(client: AsyncClient):
+    """The 502 path survives the switch to the unfiltered lister."""
+    with patch("app.routes.groups.list_groups", new=AsyncMock(side_effect=Exception("connection refused"))):
+        resp = await client.get("/api/groups")
+    assert resp.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_evaluate_still_404s_when_feature_disabled(client: AsyncClient):
+    """$evaluate keeps its groups_enabled gate — parked, unchanged from main."""
+    await _set_groups_flag(client, False)
+    resp = await client.post("/api/groups/g1/evaluate")
+    assert resp.status_code == 404
