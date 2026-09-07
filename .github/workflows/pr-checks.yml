@@ -58,7 +58,13 @@ jobs:
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 35, not 20: PR #417 added test_deqm_submit_data_workflow.py to the suite
+    # CI actually runs (it is deliberately NOT in the --ignore list below, so
+    # that DEQM regressions cannot reach main unnoticed). That roughly doubled
+    # the job — 7m33s on #411 before #417 landed, 20m15s on the same PR after —
+    # and every subsequent PR was cancelled at the old 20m ceiling.
+    # Tracked in #418; raising the ceiling is the unblock, not the fix.
+    timeout-minutes: 35
     env:
       # Soft default: STRICT_STU6=0 for rollout week. Flip to 1 once all connectathon measures pass in CI.
       STRICT_STU6: "0"
