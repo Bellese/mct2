@@ -368,6 +368,13 @@ class DataRequirementsStrategy(DataAcquisitionStrategy):
         self._mcs_url = mcs_url
         self._mcs_auth_headers = mcs_auth_headers or {}
         self._fallback = BatchQueryStrategy()
+        # One strategy instance per job, so this memoises $data-requirements for
+        # the whole run. The answer depends only on the measure, but the call
+        # compiles the measure's CQL in the engine's R4DataRequirementsService --
+        # calling it per patient drove the engine's heap past its container limit
+        # and got it OOM-killed mid-job at 319 patients.
+        self._requirements: list[dict[str, Any]] | None = None
+        self._requirements_lock = asyncio.Lock()
 
     async def gather_patients(
         self,
@@ -410,13 +417,28 @@ class DataRequirementsStrategy(DataAcquisitionStrategy):
             return await self._fallback.gather_patient_data(cdr_url, patient_id, auth_headers)
 
     async def _get_data_requirements(self) -> list[dict[str, Any]]:
-        """Call $data-requirements on MCS and return the dataRequirement entries."""
-        url = f"{self._mcs_url}/Measure/{self._measure_id}/$data-requirements"
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(url, headers=self._mcs_auth_headers)
-            resp.raise_for_status()
-            library = resp.json()
-            return library.get("dataRequirement", [])
+        """Call $data-requirements on MCS once per job and cache the entries.
+
+        Patients are gathered concurrently, so the lock keeps the first wave of
+        callers from each issuing the same expensive call; the double check means
+        every later patient is served from memory. Failures are not cached — the
+        caller falls back to `$everything`, and a transient error should not pin
+        the whole job to the fallback path.
+        """
+        if self._requirements is not None:
+            return self._requirements
+
+        async with self._requirements_lock:
+            if self._requirements is not None:
+                return self._requirements
+
+            url = f"{self._mcs_url}/Measure/{self._measure_id}/$data-requirements"
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url, headers=self._mcs_auth_headers)
+                resp.raise_for_status()
+                library = resp.json()
+                self._requirements = library.get("dataRequirement", [])
+                return self._requirements
 
     async def _fetch_by_requirements(
         self,
@@ -427,63 +449,154 @@ class DataRequirementsStrategy(DataAcquisitionStrategy):
     ) -> GatherResult:
         """Translate dataRequirement entries to CDR REST queries and collect resources.
 
-        Translates codeFilter[].valueSet into code:in={valueSetUrl} search parameters.
+        Requirements are grouped by resource type first. A type with exactly one
+        distinct valueset across all its requirements is queried with a
+        `code:in=` filter, same as before. A type with MULTIPLE distinct
+        valuesets — or a mix of filtered and unfiltered requirements — drops
+        the code filter entirely and fetches all resources of that type for
+        the patient: `code:in=vs1&code:in=vs2` is an AND in FHIR search, so
+        unioning as repeated params would narrow the result rather than widen
+        it. Over-fetching is safe for measure evaluation (CQL filters again
+        anyway); under-fetching silently changes populations with no error
+        surfaced.
+
+        Patient is always fetched by direct read, whether or not it appears in
+        the dataRequirement list — `$everything` always includes it, and its
+        absence fails evaluation regardless.
+
         Per-type failures are captured in GatherResult.failed_types.
         Raises RuntimeError only when ALL types fail (triggers outer $everything fallback).
         """
         resources: list[dict[str, Any]] = []
-        seen_types: set[str] = set()
         failed_types: list[FailedResourceFetch] = []
         failed_type_names: set[str] = set()
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            for req in requirements:
-                resource_type = req.get("type", "")
-                if not resource_type or not re.match(r"^[A-Za-z][A-Za-z0-9]{0,127}$", resource_type):
-                    continue
-                if resource_type in seen_types:
-                    continue
-                seen_types.add(resource_type)
+        # Group requirements by resource type, preserving first-seen order,
+        # and collect each requirement's valueset (None when unfiltered).
+        types_in_order: list[str] = []
+        valuesets_by_type: dict[str, list[str | None]] = {}
+        for req in requirements:
+            resource_type = req.get("type", "")
+            if not resource_type or not re.match(r"^[A-Za-z][A-Za-z0-9]{0,127}$", resource_type):
+                continue
+            if resource_type not in valuesets_by_type:
+                valuesets_by_type[resource_type] = []
+                types_in_order.append(resource_type)
+            vs: str | None = None
+            for cf in req.get("codeFilter", []):
+                candidate = cf.get("valueSet")
+                if candidate:
+                    vs = candidate
+                    break
+            valuesets_by_type[resource_type].append(vs)
 
+        # `required_types` drives the "did everything we actually needed fail"
+        # check below. Patient is fetched unconditionally as a safety net (see
+        # docstring) but is not itself a declared data requirement, so a
+        # Patient-only failure must not, by itself, count as "all required
+        # types failed" and must not prevent that check from firing when the
+        # declared types genuinely all fail.
+        required_types: set[str] = set(types_in_order)
+        if "Patient" not in required_types:
+            types_in_order.append("Patient")
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for resource_type in types_in_order:
                 try:
                     if resource_type == "Patient":
                         resp = await client.get(f"{cdr_url}/Patient/{patient_id}", headers=auth_headers)
                         if resp.status_code == 200:
                             resources.append(resp.json())
-                    else:
-                        # Translate codeFilter[].valueSet to code:in search parameter
-                        params = f"subject=Patient/{patient_id}&_count=100"
-                        for cf in req.get("codeFilter", []):
-                            vs = cf.get("valueSet")
-                            if vs:
-                                params += f"&code:in={vs}"
-                                break  # Use first valueSet codeFilter only
-                        page_url: Optional[str] = f"{cdr_url}/{resource_type}?{params}"
-                        while page_url:
-                            resp = await client.get(page_url, headers=auth_headers)
-                            if resp.status_code != 200:
-                                raise httpx.HTTPStatusError(
-                                    f"CDR returned {resp.status_code} for {resource_type}",
-                                    request=resp.request,
-                                    response=resp,
+                        else:
+                            # Recorded in `failed_types` only (drives has_partial_failure /
+                            # partial-gather reporting) — deliberately NOT added to
+                            # `failed_type_names`, which drives the "all REQUIRED types
+                            # failed" check below. That check must fire only on declared
+                            # dataRequirement types genuinely all failing; a forced
+                            # Patient-read failure must never trip it, since Patient is
+                            # always fetched via this special-cased direct read (never
+                            # the generic per-type loop) regardless of whether it also
+                            # happens to appear in the dataRequirement list.
+                            failed_types.append(
+                                FailedResourceFetch(
+                                    resource_type=resource_type,
+                                    error=f"CDR returned {resp.status_code} for Patient/{patient_id}",
                                 )
-                            bundle = resp.json()
-                            for entry in bundle.get("entry", []):
-                                resource = entry.get("resource")
-                                if resource:
-                                    resources.append(resource)
-                            page_url = None
-                            for link in bundle.get("link", []):
-                                if link.get("relation") == "next":
-                                    next_url = link.get("url")
-                                    if next_url and _same_origin(cdr_url, next_url):
-                                        page_url = next_url
-                                    elif next_url:
-                                        logger.warning(
-                                            "SSRF: pagination next link rejected (origin mismatch)",
-                                            extra={"url": sanitize_url(next_url)},
+                            )
+                    else:
+                        # Only keep a code:in= filter when every requirement for
+                        # this type agrees on a single valueset. Otherwise
+                        # over-fetch the whole type — see docstring.
+                        type_valuesets = valuesets_by_type.get(resource_type, [])
+                        distinct_valuesets = {vs for vs in type_valuesets if vs}
+                        has_unfiltered = any(vs is None for vs in type_valuesets)
+                        base_params = f"subject=Patient/{patient_id}&_count=100"
+
+                        # Try the narrow query first, then the same query without
+                        # the code filter. A `code:in=` against a ValueSet the CDR
+                        # cannot resolve fails the search outright (HAPI-2788
+                        # "Unknown ValueSet" for VSAC canonicals that were never
+                        # loaded), and treating that as "this patient has no
+                        # resources of this type" silently changes populations:
+                        # a hospice ServiceRequest dropped this way cost nine
+                        # patients their CMS130 denominator-exclusion while the
+                        # job still reported success. Over-fetching is safe —
+                        # CQL filters again anyway.
+                        attempts = []
+                        if len(distinct_valuesets) == 1 and not has_unfiltered:
+                            (single_vs,) = distinct_valuesets
+                            attempts.append(f"{base_params}&code:in={single_vs}")
+                        attempts.append(base_params)
+
+                        for attempt_index, params in enumerate(attempts):
+                            is_last_attempt = attempt_index == len(attempts) - 1
+                            # Stage into a local list so a failure part-way through
+                            # pagination cannot leave half a page in `resources`
+                            # and then duplicate it on the retry.
+                            collected: list[dict[str, Any]] = []
+                            try:
+                                page_url: Optional[str] = f"{cdr_url}/{resource_type}?{params}"
+                                while page_url:
+                                    resp = await client.get(page_url, headers=auth_headers)
+                                    if resp.status_code != 200:
+                                        raise httpx.HTTPStatusError(
+                                            f"CDR returned {resp.status_code} for {resource_type}",
+                                            request=resp.request,
+                                            response=resp,
                                         )
-                                    break
+                                    bundle = resp.json()
+                                    for entry in bundle.get("entry", []):
+                                        resource = entry.get("resource")
+                                        if resource:
+                                            collected.append(resource)
+                                    page_url = None
+                                    for link in bundle.get("link", []):
+                                        if link.get("relation") == "next":
+                                            next_url = link.get("url")
+                                            if next_url and _same_origin(cdr_url, next_url):
+                                                page_url = next_url
+                                            elif next_url:
+                                                logger.warning(
+                                                    "SSRF: pagination next link rejected (origin mismatch)",
+                                                    extra={"url": sanitize_url(next_url)},
+                                                )
+                                            break
+                            except Exception as exc:
+                                if is_last_attempt:
+                                    raise
+                                logger.warning(
+                                    "Filtered CDR query failed for %s, retrying without the code filter — %s",
+                                    resource_type,
+                                    str(exc),
+                                    extra={
+                                        "resource_type": resource_type,
+                                        "patient_id": patient_id,
+                                        "error": str(exc),
+                                    },
+                                )
+                                continue
+                            resources.extend(collected)
+                            break
                 except Exception as exc:
                     failed_type_names.add(resource_type)
                     failed_types.append(FailedResourceFetch(resource_type=resource_type, error=str(exc)))
@@ -494,8 +607,9 @@ class DataRequirementsStrategy(DataAcquisitionStrategy):
                         extra={"resource_type": resource_type, "patient_id": patient_id, "error": str(exc)},
                     )
 
-        # Only propagate failure (triggering outer $everything fallback) when all types fail
-        if seen_types and failed_type_names == seen_types:
+        # Only propagate failure (triggering outer $everything fallback) when all
+        # REQUIRED types fail — a forced Patient-fetch failure alone doesn't count.
+        if required_types and (failed_type_names & required_types) == required_types:
             raise RuntimeError(f"All resource types failed CDR fetch: {sorted(failed_type_names)}")
 
         if failed_types:
@@ -514,7 +628,7 @@ class DataRequirementsStrategy(DataAcquisitionStrategy):
                     "measure_id": self._measure_id,
                     "patient_id": patient_id,
                     "resource_count": len(resources),
-                    "requirement_types": list(seen_types),
+                    "requirement_types": list(required_types),
                 },
             )
         return GatherResult(resources=resources, failed_types=failed_types)
@@ -900,6 +1014,177 @@ async def evaluate_measure(
             return body
 
     raise RuntimeError("Measure evaluation failed without a response")
+
+
+# --- DEQM $submit-data support (spec: 2026-08-21-deqm-submit-data-workflow) ---
+
+SUBMIT_DATA_MODE_STU5 = "stu5"
+SUBMIT_DATA_MODE_BASE = "base-fallback"
+
+_DEQM_SUBMIT_DATA_CANONICAL = "http://hl7.org/fhir/us/davinci-deqm/OperationDefinition/submit-data"
+_DEQM_SUBMIT_DATA_OP_NAME = "deqm-submit-data"
+
+
+async def get_measure_canonical(
+    measure_id: str,
+    *,
+    mcs_url: str,
+    auth_headers: dict[str, str] | None = None,
+) -> str:
+    """Read Measure/{id} off the MCS and return its canonical `url|version`.
+
+    The DEQM Data Exchange MeasureReport's `measure` element must carry the
+    measure's canonical URL, which only the MCS knows. Raises
+    FhirOperationError when the Measure can't be read — the job should fail
+    fast rather than submit reports pointing at nothing. A Measure without a
+    `url` (unusual but legal) degrades to the relative reference.
+    """
+    url = f"{mcs_url}/Measure/{measure_id}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        start_ms = int(time.monotonic() * 1000)
+        resp = await client.get(url, headers=auth_headers or {})
+        latency_ms = int(time.monotonic() * 1000) - start_ms
+        if resp.status_code != 200:
+            raise FhirOperationError(
+                operation="read-measure",
+                url=url,
+                status_code=resp.status_code,
+                outcome=FhirOperationOutcome.from_response(resp),
+                latency_ms=latency_ms,
+            )
+        measure = resp.json()
+    canonical = measure.get("url")
+    if not canonical:
+        return f"Measure/{measure_id}"
+    version = measure.get("version")
+    return f"{canonical}|{version}" if version else canonical
+
+
+async def detect_submit_data_mode(
+    *,
+    mcs_url: str,
+    auth_headers: dict[str, str] | None = None,
+    timeout: float = 10.0,
+) -> str:
+    """Probe the MCS CapabilityStatement for DEQM STU5 $deqm-submit-data.
+
+    Returns SUBMIT_DATA_MODE_STU5 when the Measure resource advertises an
+    operation named `deqm-submit-data` or defined by the DEQM canonical.
+    Everything else — including an unreachable/unparseable /metadata — is
+    SUBMIT_DATA_MODE_BASE. Never raises: the probe decides the envelope,
+    it must not block job creation (the measure pre-flight already proved
+    the MCS reachable).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{mcs_url}/metadata", headers=auth_headers or {})
+            resp.raise_for_status()
+            capability = resp.json()
+        for rest in capability.get("rest", []):
+            operations = list(rest.get("operation", []))
+            for res in rest.get("resource", []):
+                if res.get("type") == "Measure":
+                    operations.extend(res.get("operation", []))
+            for op in operations:
+                if op.get("name") == _DEQM_SUBMIT_DATA_OP_NAME:
+                    return SUBMIT_DATA_MODE_STU5
+                definition = str(op.get("definition", ""))
+                # Exact match, or the canonical with a `|version` suffix — NOT any
+                # prefix. A loose startswith() let a server that merely cites the
+                # DEQM canonical (but implements only the base wire shape) get
+                # classified stu5, which then 400s on every $deqm-submit-data POST
+                # with no downgrade (see DeqmSubmitDataWorkflow.transfer_patient).
+                if definition == _DEQM_SUBMIT_DATA_CANONICAL or definition.startswith(
+                    f"{_DEQM_SUBMIT_DATA_CANONICAL}|"
+                ):
+                    return SUBMIT_DATA_MODE_STU5
+    except Exception as exc:
+        # Deferred import: app.services.validation imports from this module at
+        # module load time, so a top-level import here would be circular.
+        from app.services.validation import sanitize_error
+
+        logger.warning(
+            "CapabilityStatement probe for $deqm-submit-data failed — assuming base $submit-data",
+            extra={"mcs_url": sanitize_url(mcs_url), "error": sanitize_error(exc)},
+        )
+    return SUBMIT_DATA_MODE_BASE
+
+
+async def submit_data(
+    *,
+    mcs_url: str,
+    parameters: dict[str, Any],
+    mode: str,
+    measure_id: str,
+    auth_headers: dict[str, str] | None = None,
+) -> None:
+    """POST a $submit-data Parameters payload to the MCS.
+
+    The two modes deliberately use DIFFERENT URL shapes — do not "simplify"
+    them into one:
+
+    - STU5 mode POSTs to the type-level `Measure/$deqm-submit-data`. STU5's
+      OperationDefinition formally declares this operation type-level
+      (`instance: false`), so a spec-compliant STU5 server only implements it
+      there.
+    - Base-fallback mode POSTs to the instance-level
+      `Measure/{measure_id}/$submit-data`. This is empirical, not spec-driven:
+      probed against a local prebaked HAPI measure server, the type-level
+      `POST Measure/$submit-data` returned 400 not-supported ("does not know
+      how to handle POST operation[Measure/$submit-data]"), while the
+      instance-level `POST Measure/{id}/$submit-data` returned 200 and
+      performed a real upsert (confirmed via `_history` after two identical
+      POSTs). HAPI's clinical-reasoning module simply doesn't register the
+      type-level operation, so base mode has to target the instance.
+
+    Any 2xx is success; the response body (HAPI returns a transaction Bundle)
+    carries no information the job needs.
+
+    The reporter Organization is no longer inlined per-patient (see
+    build_submission_workflow / DeqmSubmitDataWorkflow.transfer_patient) —
+    that was the primary source of ResourceVersionConflictException under
+    concurrent batches, since every patient upserted the same shared id. This
+    retry stays as insurance for incidental conflicts only (e.g. a patient's
+    own resources overlapping a concurrent evaluate-measure read/write on the
+    same server), one retry with a short backoff before giving up — not the
+    primary defense against the shared-Organization storm anymore.
+    """
+    if mode == SUBMIT_DATA_MODE_STU5:
+        url = f"{mcs_url}/Measure/$deqm-submit-data"
+    else:
+        url = f"{mcs_url}/Measure/{measure_id}/$submit-data"
+    headers = {"Content-Type": "application/fhir+json", **(auth_headers or {})}
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for attempt in range(2):
+            start_ms = int(time.monotonic() * 1000)
+            resp = await client.post(url, json=parameters, headers=headers)
+            latency_ms = int(time.monotonic() * 1000) - start_ms
+            if resp.status_code >= 300:
+                if resp.status_code in (409, 412) and attempt < 1:
+                    logger.warning(
+                        "Conflict submitting $submit-data (HTTP %s) — retrying",
+                        resp.status_code,
+                        extra={
+                            "mcs_url": sanitize_url(mcs_url),
+                            "status_code": resp.status_code,
+                            "attempt": attempt + 1,
+                        },
+                    )
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                raise FhirOperationError(
+                    operation="submit-data",
+                    url=url,
+                    status_code=resp.status_code,
+                    outcome=FhirOperationOutcome.from_response(resp),
+                    latency_ms=latency_ms,
+                )
+            logger.info(
+                "Submitted data via %s",
+                mode,
+                extra={"mcs_url": sanitize_url(mcs_url), "latency_ms": latency_ms},
+            )
+            return
 
 
 async def _remap_valueset_ids_for_hapi(

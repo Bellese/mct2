@@ -69,6 +69,20 @@ async def test_create_job_missing_fields(client):
     assert resp.status_code == 422
 
 
+async def test_create_job_path_bearing_measure_id_rejected(client):
+    """F7: measure_id is interpolated into CDR/MCS URL paths (e.g.
+    Measure/{measure_id}/$submit-data) — a value that could rewrite that path
+    must be rejected with 422, mirroring the existing group_id validator."""
+    payload = {
+        "measure_id": "../../etc/passwd",
+        "period_start": "2024-01-01",
+        "period_end": "2024-12-31",
+        "cdr_url": "https://example.com/fhir",
+    }
+    resp = await client.post("/jobs", json=payload)
+    assert resp.status_code == 422
+
+
 async def test_create_job_uses_default_cdr_url(client):
     """POST /jobs without cdr_url falls back to default."""
     payload = {
@@ -1517,3 +1531,65 @@ async def test_get_comparison_auth_failure_names_credentials(client, test_sessio
     diagnostics = resp.json()["detail"]["issue"][0]["diagnostics"]
     assert "rejected" in diagnostics
     assert "credentials" in diagnostics
+
+
+class TestJobWorkflowSelection:
+    """POST /jobs workflow selection + $submit-data capability snapshot (spec:
+    2026-08-21-deqm-submit-data-workflow)."""
+
+    async def test_create_job_defaults_to_direct_load(self, client, measure_present):
+        resp = await client.post(
+            "/jobs",
+            json={
+                "measure_id": "M1",
+                "period_start": "2025-01-01",
+                "period_end": "2025-12-31",
+            },
+        )
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["workflow"] == "direct_load"
+        assert body["submit_data_mode"] is None
+
+    async def test_create_job_rejects_unknown_workflow(self, client, measure_present):
+        resp = await client.post(
+            "/jobs",
+            json={
+                "measure_id": "M1",
+                "period_start": "2025-01-01",
+                "period_end": "2025-12-31",
+                "workflow": "carrier-pigeon",
+            },
+        )
+        assert resp.status_code == 422
+
+    async def test_deqm_job_records_probe_result(self, client, measure_present):
+        with patch("app.routes.jobs.detect_submit_data_mode", new=AsyncMock(return_value="base-fallback")) as probe:
+            resp = await client.post(
+                "/jobs",
+                json={
+                    "measure_id": "M1",
+                    "period_start": "2025-01-01",
+                    "period_end": "2025-12-31",
+                    "workflow": "deqm_submit_data",
+                },
+            )
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["workflow"] == "deqm_submit_data"
+        assert body["submit_data_mode"] == "base-fallback"
+        probe.assert_awaited_once()
+
+    async def test_direct_load_job_skips_probe(self, client, measure_present):
+        with patch("app.routes.jobs.detect_submit_data_mode", new=AsyncMock()) as probe:
+            resp = await client.post(
+                "/jobs",
+                json={
+                    "measure_id": "M1",
+                    "period_start": "2025-01-01",
+                    "period_end": "2025-12-31",
+                    "workflow": "direct_load",
+                },
+            )
+        assert resp.status_code == 201
+        probe.assert_not_awaited()

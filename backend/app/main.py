@@ -238,6 +238,8 @@ async def _run_schema_migrations(conn) -> None:
             "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS mcs_auth_type VARCHAR(32)",
             # Issue #392. FALSE on existing rows = scoped wipe, the safe default.
             "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS mcs_wipe_before_job BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS workflow VARCHAR(32) NOT NULL DEFAULT 'direct_load'",
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS submit_data_mode VARCHAR(32)",
             "ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS delete_requested BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ",
             "ALTER TABLE validation_runs ADD COLUMN IF NOT EXISTS mcs_id INTEGER "

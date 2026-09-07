@@ -71,16 +71,41 @@ backend/app/
     validation.py   POST /validation/upload, GET /validation/runs
 
   services/
-    orchestrator.py      Core job execution. Pulls patients, runs $evaluate-measure in batches,
-                         stores MeasureReports. Group filtering via group_id param. Reads live
+    orchestrator.py      Core job execution. Pulls patients, builds the job's submission
+                         workflow (see workflows.py) once per job, runs it per-patient for
+                         phase 1, then runs $evaluate-measure in batches for phase 2, storing
+                         MeasureReports. Group filtering via group_id param. Reads live
                          CDR credentials from cdr_configs via job.cdr_id FK; routes
                          $evaluate-measure at the per-job MCS snapshot (job.mcs_url, falling
                          back to settings.MEASURE_ENGINE_URL for legacy rows).
+    workflows.py         Per-job submission-workflow strategies (SubmissionWorkflow ABC),
+                         selected by `Job.workflow` at job creation and built once per job
+                         before any patient work: `direct_load` (today's behavior — env-
+                         configured gather via DataAcquisitionStrategy, then a Bundle of PUTs
+                         straight to the measure engine) and `deqm_submit_data` (targeted
+                         $data-requirements queries → a DEQM Data Exchange MeasureReport
+                         (deqm.py) → `Measure/$submit-data` → the same $evaluate-measure phase
+                         2). Both label per-patient transfer failures via TransferPhaseError,
+                         surfaced as MeasureResult.error_phase ("gather" for direct_load;
+                         "gather" or "submit" for deqm_submit_data).
     fhir_client.py       All FHIR server communication. DataAcquisitionStrategy ABC with two
                          implementations: BatchQueryStrategy (paginated /Patient + $everything)
                          and DataRequirementsStrategy (DEQM spec — calls $data-requirements on
                          the measure engine, then fetches only the required resource types from
-                         the CDR; falls back to $everything on any failure).
+                         the CDR; falls back to $everything on any failure). $data-requirements
+                         is fetched once per job and memoised on the strategy instance: the call
+                         compiles the measure's CQL in the engine, and issuing it per patient
+                         drove the engine past its container memory limit at 319 patients. Each
+                         type is queried with its `code:in=` valueset filter first and then
+                         WITHOUT the filter if that query fails — a VSAC canonical the CDR never
+                         loaded returns HAPI-2788 rather than an empty set, and treating that as
+                         "no such resources" silently changes populations. Also home to the
+                         DEQM $submit-data capability probe: detect_submit_data_mode() reads the
+                         MCS CapabilityStatement at job creation and stamps `Job.submit_data_mode`
+                         as `stu5` or `base-fallback`, which decides which URL shape/envelope
+                         submit_data() uses. A mis-probed `stu5` that 400s/404s on the real POST
+                         downgrades to base mode at runtime and retries once (workflows.py); the
+                         stored `Job.submit_data_mode` still reflects the original probe verdict.
     bundle_loader.py     Startup bundle loader. Called once during FastAPI lifespan. Scans
                          seed/connectathon-bundles/, waits for HAPI readiness, then loads each
                          .json file via triage_test_bundle (Measure/Library → MCS, clinical

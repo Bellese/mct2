@@ -24,7 +24,13 @@ from app.dependencies import (
 )
 from app.models.job import BatchStatus, Job, JobStatus, MeasureResult
 from app.models.validation import ExpectedResult
-from app.services.fhir_client import _build_auth_headers, _validate_ssrf_url, list_groups, measure_exists
+from app.services.fhir_client import (
+    _build_auth_headers,
+    _validate_ssrf_url,
+    detect_submit_data_mode,
+    list_groups,
+    measure_exists,
+)
 from app.services.fhir_errors import sanitize_url
 from app.services.validation import _extract_population_counts, compare_populations, sanitize_error
 
@@ -38,12 +44,15 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
 _GROUP_ID_RE = re.compile(r"^[A-Za-z0-9_\-\.]{1,256}$")
+_MEASURE_ID_RE = re.compile(r"^[A-Za-z0-9_\-\.]{1,256}$")
 
 # Ceiling for the `measure_exists` pre-flight on POST /jobs. The connection's own
 # `request_timeout_seconds` (up to 1800s) is sized for measure evaluation, not for
 # a `_summary=count` lookup on an interactive request. Taken as a min() with the
 # connection value so a deliberately short connection timeout still wins.
 _PREFLIGHT_TIMEOUT_SECONDS = 10
+
+_VALID_WORKFLOWS = {"direct_load", "deqm_submit_data"}
 
 
 class JobCreate(BaseModel):
@@ -53,6 +62,7 @@ class JobCreate(BaseModel):
     period_end: str
     cdr_url: Optional[str] = None  # if omitted, use active CDR config or default
     group_id: Optional[str] = None  # if set, only evaluate patients in this FHIR Group
+    workflow: str = "direct_load"
 
     @field_validator("group_id")
     @classmethod
@@ -60,6 +70,21 @@ class JobCreate(BaseModel):
         """Reject group_id values that could rewrite the CDR URL path."""
         if v is not None and not _GROUP_ID_RE.match(v):
             raise ValueError("group_id must be alphanumeric with hyphens, underscores, or dots only")
+        return v
+
+    @field_validator("measure_id")
+    @classmethod
+    def validate_measure_id(cls, v: str) -> str:
+        """Reject measure_id values that could rewrite the CDR/MCS URL path."""
+        if not _MEASURE_ID_RE.match(v):
+            raise ValueError("measure_id must be alphanumeric with hyphens, underscores, or dots only")
+        return v
+
+    @field_validator("workflow")
+    @classmethod
+    def validate_workflow(cls, v: str) -> str:
+        if v not in _VALID_WORKFLOWS:
+            raise ValueError(f"workflow must be one of {sorted(_VALID_WORKFLOWS)}")
         return v
 
 
@@ -84,6 +109,8 @@ class JobResponse(BaseModel):
     completed_at: Optional[str]
     started_at: Optional[str] = None
     error_message: Optional[str]
+    workflow: str = "direct_load"
+    submit_data_mode: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -133,6 +160,8 @@ def _job_to_response(job: Job) -> dict:
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "error_message": job.error_message,
+        "workflow": job.workflow,
+        "submit_data_mode": job.submit_data_mode,
     }
 
 
@@ -227,13 +256,14 @@ async def create_job(
     # the count query does and deserves the same 502 OperationOutcome rather
     # than a bare 500. (Unlike the measures routes, nothing in this `except`
     # chain special-cases a status code, so no mis-mapping is possible here.)
+    preflight_timeout = float(min(mcs.request_timeout_seconds, _PREFLIGHT_TIMEOUT_SECONDS))
     try:
         mcs_auth_headers = await _build_auth_headers(mcs.auth_type, mcs.auth_credentials)
         found = await measure_exists(
             body.measure_id,
             mcs.mcs_url,
             auth_headers=mcs_auth_headers,
-            timeout=float(min(mcs.request_timeout_seconds, _PREFLIGHT_TIMEOUT_SECONDS)),
+            timeout=preflight_timeout,
         )
     except Exception as exc:
         logger.warning(
@@ -275,6 +305,18 @@ async def create_job(
             },
         )
 
+    # For DEQM jobs, decide the $submit-data wire format now and snapshot it.
+    # The probe never raises (detect_submit_data_mode swallows errors into
+    # base-fallback), so it cannot block creation; base-fallback renders as an
+    # STU5-compliance warning in the UI from the moment the job appears.
+    submit_data_mode: str | None = None
+    if body.workflow == "deqm_submit_data":
+        submit_data_mode = await detect_submit_data_mode(
+            mcs_url=mcs.mcs_url,
+            auth_headers=mcs_auth_headers,
+            timeout=preflight_timeout,
+        )
+
     job = Job(
         measure_id=body.measure_id,
         measure_name=body.measure_name,
@@ -292,6 +334,8 @@ async def create_job(
         mcs_id=mcs.id if mcs.id else None,
         mcs_auth_type=mcs.auth_type.value if mcs.auth_type else None,
         mcs_wipe_before_job=mcs.wipe_before_job,
+        workflow=body.workflow,
+        submit_data_mode=submit_data_mode,
     )
     session.add(job)
     await session.commit()
