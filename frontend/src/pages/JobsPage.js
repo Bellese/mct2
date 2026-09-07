@@ -55,7 +55,7 @@ export default function JobsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [showModal, setShowModal] = useState(false);
-  const [formData, setFormData] = useState({ measure_id: '', group_id: '', period_start: '', period_end: '' });
+  const [formData, setFormData] = useState({ measure_id: '', group_id: '', period_start: '', period_end: '', workflow: 'direct_load' });
   const [creating, setCreating] = useState(false);
   const [confirmJob, setConfirmJob] = useState(null);
   const [deletingJobIds, setDeletingJobIds] = useState([]);
@@ -160,13 +160,17 @@ export default function JobsPage() {
     if (!formData.measure_id) { toast.error('Please select a measure'); return; }
     setCreating(true);
     try {
-      await createJob({
+      const created = await createJob({
         measure_id: formData.measure_id,
         group_id: formData.group_id || undefined,
         period_start: formData.period_start || undefined,
         period_end: formData.period_end || undefined,
+        workflow: formData.workflow,
       });
       toast.success('Calculation started');
+      if (created?.submit_data_mode === 'base-fallback') {
+        toast.warning('MCS does not support DEQM STU5 $deqm-submit-data — falling back to base $submit-data.');
+      }
       setShowModal(false);
       setFormData(prev => ({ ...prev, period_start: '', period_end: '' }));
       loadJobs();
@@ -389,6 +393,7 @@ export default function JobsPage() {
                   const running = isRunning(job.status);
                   const complete = isComplete(job.status);
                   const deleting = job.delete_requested || deletingJobIds.includes(job.id);
+                  const isFallback = job.submit_data_mode === 'base-fallback';
                   return (
                     <tr
                       key={job.id}
@@ -409,7 +414,22 @@ export default function JobsPage() {
                       </td>
                       <td data-label="Cohort" className={styles.cohortCell}>{getCohortName(job)}</td>
                       <td data-label="Patients" className={styles.patientCountCell}>{getPatientCount(job)}</td>
-                      <td data-label="Status"><StatusBadge status={job.status} /></td>
+                      <td data-label="Status">
+                        <StatusBadge status={job.status} />
+                        {job.workflow === 'deqm_submit_data' && (
+                          <span
+                            className={`${styles.workflowTag} ${isFallback ? styles.workflowTagWarn : ''}`}
+                            title={isFallback
+                              ? 'MCS does not support DEQM STU5 $deqm-submit-data — base $submit-data fallback used.'
+                              : 'DEQM STU5 $deqm-submit-data'}
+                            aria-label={isFallback
+                              ? 'DEQM — MCS does not support DEQM STU5 $deqm-submit-data — base $submit-data fallback used.'
+                              : 'DEQM — DEQM STU5 $deqm-submit-data'}
+                          >
+                            DEQM{isFallback ? ' ⚠' : ''}
+                          </span>
+                        )}
+                      </td>
                       <td data-label="Queued" className={styles.dateCell}>{formatDateTime(job.created_at)}</td>
                       <td data-label="Started" className={styles.dateCell}>{job.started_at ? formatDateTime(job.started_at) : '—'}</td>
                       <td data-label="Duration" className={styles.dateCell}>{formatDuration(job.started_at || (job.completed_at ? job.created_at : null), job.completed_at)}</td>
@@ -480,6 +500,14 @@ export default function JobsPage() {
                       : (cmsId || g.name || g.id);
                     return <option key={g.id} value={g.id}>{label} ({g.member_count} patients)</option>;
                   })}
+                </select>
+              </div>
+              <div className={styles.field}>
+                <label className={styles.label} htmlFor="workflow-select">Data submission workflow</label>
+                <select id="workflow-select" className={styles.select} value={formData.workflow}
+                  onChange={e => setFormData(p => ({ ...p, workflow: e.target.value }))}>
+                  <option value="direct_load">Direct load — $everything (default)</option>
+                  <option value="deqm_submit_data">DEQM Data Exchange — $submit-data (STU5)</option>
                 </select>
               </div>
               <PeriodPicker

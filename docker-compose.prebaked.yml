@@ -10,6 +10,14 @@ services:
 
   hapi-fhir-measure:
     volumes: []
-    mem_limit: 6g
+    # 8g, not 6g: -Xmx4g caps the Java heap but not the JVM's native footprint
+    # (Lucene, metaspace, direct buffers, thread stacks), and DEQM's
+    # transaction-backed $submit-data pushed total RSS past a 6g ceiling on
+    # back-to-back jobs. The kernel then killed the process -- a docker `oom`
+    # event and exit 137, with no Java OutOfMemoryError and no heapdump, which
+    # surfaces to callers as a bare connection error. Keep the heap at 4g and
+    # give the native side room instead. This limit also applies in CI, so it
+    # has to leave space for the CDR alongside it on a 16g runner.
+    mem_limit: 8g
     environment:
       - JAVA_TOOL_OPTIONS=-Xmx4g -Xms256m -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/data/hapi/heapdump.hprof

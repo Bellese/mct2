@@ -84,6 +84,16 @@ class Job(Base):
     # scoping is never destructive, and it cannot corrupt results either, because
     # evaluation is per-subject (see `wipe_patients_by_id`).
     mcs_wipe_before_job: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Data submission workflow (spec: 2026-08-21-deqm-submit-data-workflow).
+    # Snapshotted at creation like the connection fields; legacy rows read as
+    # direct_load, which is exactly how they behaved.
+    workflow: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="direct_load", server_default="direct_load"
+    )
+    # Wire-format decision from the creation-time CapabilityStatement probe:
+    # "stu5" | "base-fallback". NULL for direct_load jobs, where no $submit-data
+    # call ever happens. base-fallback renders as an STU5-compliance warning.
+    submit_data_mode: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     batches: Mapped[list["Batch"]] = relationship(
         "Batch", back_populates="job", cascade="all, delete-orphan", lazy="selectin"

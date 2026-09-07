@@ -1,11 +1,14 @@
 """Tests for the FHIR client service (fhir_client.py)."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
 from app.services.fhir_client import (
+    SUBMIT_DATA_MODE_BASE,
+    SUBMIT_DATA_MODE_STU5,
     BatchQueryStrategy,
     DataRequirementsStrategy,
     _acquire_smart_token,
@@ -13,11 +16,14 @@ from app.services.fhir_client import (
     _chunk_request_entries,
     _remap_valueset_ids_for_hapi,
     delete_measure,
+    detect_submit_data_mode,
     evaluate_measure,
+    get_measure_canonical,
     list_measures,
     measure_exists,
     push_resources,
     resolve_evaluated_resource,
+    submit_data,
     upload_measure_bundle,
     wait_for_valueset_expansion,
     wipe_measure_definitions,
@@ -2236,6 +2242,49 @@ async def test_data_requirements_strategy_non_200_patient_not_appended():
     assert resources == []
 
 
+async def test_data_requirements_strategy_patient_failure_reports_partial_gather():
+    """F2: a non-200 Patient read must be recorded as a FailedResourceFetch so
+    the gather is reported as partial (has_partial_failure) — previously it
+    was swallowed with no failure record and no way to attribute a later
+    failure to the missing Patient. Patient must still NOT be added to
+    required_types: the declared Condition requirement succeeds, so no
+    $everything fallback should fire."""
+    data_req_response = {
+        "resourceType": "Library",
+        "dataRequirement": [{"type": "Condition"}],
+    }
+    cond_bundle = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [{"resource": {"resourceType": "Condition", "id": "c1"}}],
+        "link": [],
+    }
+
+    async def mock_get(url, **kwargs):
+        if "$data-requirements" in url:
+            return _make_response(200, data_req_response)
+        if "/Patient/p1" in url:
+            return _make_response(404, {"resourceType": "OperationOutcome"})
+        if "Condition" in url:
+            return _make_response(200, cond_bundle)
+        return _make_response(200, {"resourceType": "Bundle", "entry": [], "link": []})
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        gather_result = await strategy.gather_patient_data("http://cdr/fhir", "p1", {})
+
+    assert gather_result.resources == [{"resourceType": "Condition", "id": "c1"}]
+    assert gather_result.has_partial_failure is True
+    assert [f.resource_type for f in gather_result.failed_types] == ["Patient"]
+    everything_calls = [c for c in mock_ctx.get.call_args_list if "$everything" in str(c)]
+    assert len(everything_calls) == 0  # Condition (the only declared requirement) succeeded
+
+
 async def test_data_requirements_strategy_non_200_resource_entries_skipped():
     """When ALL required types return non-200, the $everything fallback is triggered."""
     data_req_response = {
@@ -2293,6 +2342,11 @@ async def test_fetch_by_requirements_code_filter_appends_code_in():
         captured_urls.append(url)
         if "$data-requirements" in url:
             return _make_response(200, data_req_response)
+        if "/Patient/" in url:
+            # Patient is now always fetched too (I3) — simulate "not found" so
+            # this test's resource count stays scoped to the declared Observation
+            # requirement, which is what it's actually exercising.
+            return _make_response(404, {"resourceType": "OperationOutcome"})
         return _make_response(200, obs_bundle)
 
     with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
@@ -2366,6 +2420,11 @@ async def test_fetch_by_requirements_no_filter_type_only():
         captured_urls.append(url)
         if "$data-requirements" in url:
             return _make_response(200, data_req_response)
+        if "/Patient/" in url:
+            # Patient is now always fetched too (I3) — simulate "not found" so
+            # this test's resource count stays scoped to the declared
+            # Encounter requirement, which is what it's actually exercising.
+            return _make_response(404, {"resourceType": "OperationOutcome"})
         return _make_response(200, enc_bundle)
 
     with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
@@ -2424,6 +2483,228 @@ async def test_fetch_by_requirements_one_type_fails_partial_result_no_fallback()
     assert not any(r.get("resourceType") == "Condition" for r in resources)
     everything_calls = [c for c in mock_ctx.get.call_args_list if "$everything" in str(c)]
     assert len(everything_calls) == 0
+
+
+async def test_fetch_by_requirements_multiple_valuesets_drop_filter_and_overfetch():
+    """Two requirements of the same type with DIFFERENT valuesets must not be
+    ANDed via repeated code:in= params (I3) — that would narrow, not union,
+    the result. The type is fetched unfiltered instead."""
+    vs1 = "http://example.org/ValueSet/vs1"
+    vs2 = "http://example.org/ValueSet/vs2"
+    data_req_response = {
+        "resourceType": "Library",
+        "dataRequirement": [
+            {"type": "Observation", "codeFilter": [{"valueSet": vs1}]},
+            {"type": "Observation", "codeFilter": [{"valueSet": vs2}]},
+        ],
+    }
+    obs_bundle = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [
+            {"resource": {"resourceType": "Observation", "id": "o1"}},
+            {"resource": {"resourceType": "Observation", "id": "o2"}},
+        ],
+        "link": [],
+    }
+
+    captured_urls: list[str] = []
+
+    async def mock_get(url, **kwargs):
+        captured_urls.append(url)
+        if "$data-requirements" in url:
+            return _make_response(200, data_req_response)
+        if "/Patient/" in url:
+            return _make_response(404, {"resourceType": "OperationOutcome"})
+        return _make_response(200, obs_bundle)
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        gather_result = await strategy.gather_patient_data("http://cdr/fhir", "p1", {})
+        resources = gather_result.resources
+
+    obs_urls = [u for u in captured_urls if "Observation" in u]
+    assert len(obs_urls) == 1, f"Observation should be fetched exactly once, got {obs_urls}"
+    assert "code:in" not in obs_urls[0]
+    assert len(resources) == 2
+
+
+async def test_fetch_by_requirements_single_valueset_filter_preserved():
+    """A single distinct valueset across all of a type's requirements still
+    keeps the code:in= filter (I3 — the conservative path is only for
+    disagreeing/mixed requirements)."""
+    vs_url = "http://example.org/ValueSet/vs1"
+    data_req_response = {
+        "resourceType": "Library",
+        "dataRequirement": [
+            {"type": "Observation", "codeFilter": [{"valueSet": vs_url}]},
+            {"type": "Observation", "codeFilter": [{"valueSet": vs_url}]},  # same valueset, repeated
+        ],
+    }
+    obs_bundle = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [{"resource": {"resourceType": "Observation", "id": "o1"}}],
+        "link": [],
+    }
+
+    captured_urls: list[str] = []
+
+    async def mock_get(url, **kwargs):
+        captured_urls.append(url)
+        if "$data-requirements" in url:
+            return _make_response(200, data_req_response)
+        if "/Patient/" in url:
+            return _make_response(404, {"resourceType": "OperationOutcome"})
+        return _make_response(200, obs_bundle)
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        gather_result = await strategy.gather_patient_data("http://cdr/fhir", "p1", {})
+        resources = gather_result.resources
+
+    obs_urls = [u for u in captured_urls if "Observation" in u]
+    assert len(obs_urls) == 1
+    assert f"code:in={vs_url}" in obs_urls[0]
+    assert len(resources) == 1
+
+
+async def test_fetch_by_requirements_mixed_filtered_and_unfiltered_drops_filter():
+    """One requirement for a type carries a codeFilter, another for the SAME
+    type has none — the mix must drop the filter and over-fetch, same as the
+    multiple-distinct-valuesets case (coverage-audit gap fill for the
+    `has_unfiltered` branch of the grouping logic in I3)."""
+    vs_url = "http://example.org/ValueSet/vs1"
+    data_req_response = {
+        "resourceType": "Library",
+        "dataRequirement": [
+            {"type": "Observation", "codeFilter": [{"valueSet": vs_url}]},
+            {"type": "Observation"},  # same type, no codeFilter at all
+        ],
+    }
+    obs_bundle = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [
+            {"resource": {"resourceType": "Observation", "id": "o1"}},
+            {"resource": {"resourceType": "Observation", "id": "o2"}},
+        ],
+        "link": [],
+    }
+
+    captured_urls: list[str] = []
+
+    async def mock_get(url, **kwargs):
+        captured_urls.append(url)
+        if "$data-requirements" in url:
+            return _make_response(200, data_req_response)
+        if "/Patient/" in url:
+            return _make_response(404, {"resourceType": "OperationOutcome"})
+        return _make_response(200, obs_bundle)
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        gather_result = await strategy.gather_patient_data("http://cdr/fhir", "p1", {})
+        resources = gather_result.resources
+
+    obs_urls = [u for u in captured_urls if "Observation" in u]
+    assert len(obs_urls) == 1, f"Observation should be fetched exactly once, got {obs_urls}"
+    assert "code:in" not in obs_urls[0]
+    assert len(resources) == 2
+
+
+async def test_fetch_by_requirements_patient_always_fetched_even_when_absent():
+    """Patient is fetched by direct read even when it's not a declared
+    dataRequirement — $everything always includes it, and its absence fails
+    evaluation regardless (I3)."""
+    data_req_response = {
+        "resourceType": "Library",
+        "dataRequirement": [{"type": "Observation"}],
+    }
+    obs_bundle = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [{"resource": {"resourceType": "Observation", "id": "o1"}}],
+        "link": [],
+    }
+    patient_resource = {"resourceType": "Patient", "id": "p1"}
+
+    captured_urls: list[str] = []
+
+    async def mock_get(url, **kwargs):
+        captured_urls.append(url)
+        if "$data-requirements" in url:
+            return _make_response(200, data_req_response)
+        if "/Patient/p1" in url:
+            return _make_response(200, patient_resource)
+        return _make_response(200, obs_bundle)
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        gather_result = await strategy.gather_patient_data("http://cdr/fhir", "p1", {})
+        resources = gather_result.resources
+
+    assert any(u.endswith("/Patient/p1") for u in captured_urls), (
+        f"Patient should always be fetched by direct read, got {captured_urls}"
+    )
+    assert any(r.get("resourceType") == "Patient" and r.get("id") == "p1" for r in resources)
+    assert any(r.get("resourceType") == "Observation" for r in resources)
+
+
+async def test_fetch_by_requirements_all_required_types_fail_triggers_fallback_despite_patient():
+    """A forced Patient-fetch success/failure must not mask "all REQUIRED types
+    failed" — the fallback trigger only counts declared dataRequirement types."""
+    data_req_response = {
+        "resourceType": "Library",
+        "dataRequirement": [{"type": "Condition"}],
+    }
+    empty_bundle = {"resourceType": "Bundle", "type": "searchset", "entry": [], "link": []}
+
+    async def mock_get(url, **kwargs):
+        if "$data-requirements" in url:
+            return _make_response(200, data_req_response)
+        if "$everything" in url:
+            return _make_response(200, empty_bundle)
+        if "/Patient/p1" in url:
+            # Patient direct-read failure — must not count toward "required
+            # types" and must not itself block the fallback below.
+            return _make_response(404, {"resourceType": "OperationOutcome"})
+        # Condition search fails
+        return _make_response(500, {"resourceType": "OperationOutcome"})
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        gather_result = await strategy.gather_patient_data("http://cdr/fhir", "p1", {})
+        resources = gather_result.resources
+
+    assert resources == []
+    everything_calls = [c for c in mock_ctx.get.call_args_list if "$everything" in str(c)]
+    assert len(everything_calls) == 1
 
 
 async def test_data_requirements_strategy_gather_patients_delegates_to_batch():
@@ -2608,3 +2889,480 @@ def test_mcs_target_requires_every_field():
 
     with pytest.raises(TypeError):
         McsTarget(url="https://mcs.example.org/fhir")  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
+# DEQM $submit-data support (spec: 2026-08-21-deqm-submit-data-workflow)
+# ---------------------------------------------------------------------------
+
+
+def _mock_async_client(mock_httpx, *, get=None, post=None):
+    """Wire an AsyncMock client into the patched httpx.AsyncClient ctor."""
+    ctx = AsyncMock()
+    if get is not None:
+        ctx.get = get
+    if post is not None:
+        ctx.post = post
+    mock_httpx.return_value.__aenter__ = AsyncMock(return_value=ctx)
+    mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+    return ctx
+
+
+class TestGetMeasureCanonical:
+    async def test_returns_url_pipe_version(self):
+        measure = {"resourceType": "Measure", "id": "m1", "url": "http://ex.org/Measure/m1", "version": "2.0"}
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, get=AsyncMock(return_value=_make_response(200, measure)))
+            result = await get_measure_canonical("m1", mcs_url="http://mcs")
+        assert result == "http://ex.org/Measure/m1|2.0"
+
+    async def test_returns_bare_url_without_version(self):
+        measure = {"resourceType": "Measure", "id": "m1", "url": "http://ex.org/Measure/m1"}
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, get=AsyncMock(return_value=_make_response(200, measure)))
+            result = await get_measure_canonical("m1", mcs_url="http://mcs")
+        assert result == "http://ex.org/Measure/m1"
+
+    async def test_falls_back_to_relative_reference_when_url_missing(self):
+        measure = {"resourceType": "Measure", "id": "m1"}
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, get=AsyncMock(return_value=_make_response(200, measure)))
+            result = await get_measure_canonical("m1", mcs_url="http://mcs")
+        assert result == "Measure/m1"
+
+    async def test_raises_on_http_error(self):
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(
+                mock_httpx, get=AsyncMock(return_value=_make_response(404, {"resourceType": "OperationOutcome"}))
+            )
+            with pytest.raises(FhirOperationError):
+                await get_measure_canonical("m1", mcs_url="http://mcs")
+
+
+class TestDetectSubmitDataMode:
+    def _capability(self, operations: list[dict]) -> dict:
+        return {
+            "resourceType": "CapabilityStatement",
+            "rest": [{"mode": "server", "resource": [{"type": "Measure", "operation": operations}]}],
+        }
+
+    async def test_stu5_when_deqm_operation_name_present(self):
+        cap = self._capability([{"name": "deqm-submit-data", "definition": "http://x"}])
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, get=AsyncMock(return_value=_make_response(200, cap)))
+            assert await detect_submit_data_mode(mcs_url="http://mcs") == SUBMIT_DATA_MODE_STU5
+
+    async def test_stu5_when_deqm_canonical_definition_present(self):
+        cap = self._capability(
+            [{"name": "whatever", "definition": "http://hl7.org/fhir/us/davinci-deqm/OperationDefinition/submit-data"}]
+        )
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, get=AsyncMock(return_value=_make_response(200, cap)))
+            assert await detect_submit_data_mode(mcs_url="http://mcs") == SUBMIT_DATA_MODE_STU5
+
+    async def test_fallback_when_only_base_submit_data(self):
+        cap = self._capability(
+            [{"name": "submit-data", "definition": "http://hl7.org/fhir/OperationDefinition/Measure-submit-data"}]
+        )
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, get=AsyncMock(return_value=_make_response(200, cap)))
+            assert await detect_submit_data_mode(mcs_url="http://mcs") == SUBMIT_DATA_MODE_BASE
+
+    async def test_stu5_when_deqm_canonical_has_version_suffix(self):
+        """I4: `canonical|version` must still match — not just the bare canonical."""
+        cap = self._capability(
+            [
+                {
+                    "name": "whatever",
+                    "definition": "http://hl7.org/fhir/us/davinci-deqm/OperationDefinition/submit-data|5.0.0",
+                }
+            ]
+        )
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, get=AsyncMock(return_value=_make_response(200, cap)))
+            assert await detect_submit_data_mode(mcs_url="http://mcs") == SUBMIT_DATA_MODE_STU5
+
+    async def test_base_when_definition_only_a_prefix_of_the_canonical(self):
+        """I4: tightened match. A server that cites the DEQM canonical as a mere
+        PREFIX (e.g. appends a path segment instead of a `|version`) — not an
+        exact match or `|version` suffix — must not be classified stu5. A loose
+        startswith() here 400s every $deqm-submit-data POST with no downgrade
+        for a server that never actually implements it."""
+        cap = self._capability(
+            [
+                {
+                    "name": "whatever",
+                    "definition": "http://hl7.org/fhir/us/davinci-deqm/OperationDefinition/submit-data-extended",
+                }
+            ]
+        )
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, get=AsyncMock(return_value=_make_response(200, cap)))
+            assert await detect_submit_data_mode(mcs_url="http://mcs") == SUBMIT_DATA_MODE_BASE
+
+    async def test_fallback_when_probe_raises(self):
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, get=AsyncMock(side_effect=httpx.ConnectError("boom")))
+            assert await detect_submit_data_mode(mcs_url="http://mcs") == SUBMIT_DATA_MODE_BASE
+
+
+class TestSubmitData:
+    async def test_posts_to_deqm_operation_in_stu5_mode(self):
+        post = AsyncMock(return_value=_make_response(200, {"resourceType": "Bundle"}))
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, post=post)
+            await submit_data(
+                mcs_url="http://mcs",
+                parameters={"resourceType": "Parameters"},
+                mode=SUBMIT_DATA_MODE_STU5,
+                measure_id="M1",
+            )
+        assert post.call_args[0][0] == "http://mcs/Measure/$deqm-submit-data"
+
+    async def test_posts_to_instance_level_operation_in_base_mode(self):
+        # Empirically verified against a local prebaked HAPI measure server: the
+        # type-level POST /Measure/$submit-data returns 400 not-supported ("does
+        # not know how to handle POST operation[Measure/$submit-data]"), while the
+        # instance-level POST /Measure/{id}/$submit-data returns 200 and performs a
+        # real upsert. Base-fallback mode must use the instance-level shape.
+        post = AsyncMock(return_value=_make_response(200, {"resourceType": "Bundle"}))
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, post=post)
+            await submit_data(
+                mcs_url="http://mcs",
+                parameters={"resourceType": "Parameters"},
+                mode=SUBMIT_DATA_MODE_BASE,
+                measure_id="M1",
+            )
+        assert post.call_args[0][0] == "http://mcs/Measure/M1/$submit-data"
+
+    async def test_base_and_stu5_modes_produce_different_url_shapes(self):
+        # Regression guard for the ruling this test file encodes: base-fallback
+        # is instance-level (Measure/{id}/$submit-data) because that's the only
+        # shape HAPI accepts; STU5 is type-level (Measure/$deqm-submit-data)
+        # because STU5's OperationDefinition formally declares the operation
+        # type-level (`instance: false`). The two must never collapse to one shape.
+        post = AsyncMock(return_value=_make_response(200, {"resourceType": "Bundle"}))
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, post=post)
+            await submit_data(
+                mcs_url="http://mcs",
+                parameters={"resourceType": "Parameters"},
+                mode=SUBMIT_DATA_MODE_BASE,
+                measure_id="M1",
+            )
+            base_url = post.call_args[0][0]
+
+            await submit_data(
+                mcs_url="http://mcs",
+                parameters={"resourceType": "Parameters"},
+                mode=SUBMIT_DATA_MODE_STU5,
+                measure_id="M1",
+            )
+            stu5_url = post.call_args[0][0]
+
+        assert base_url == "http://mcs/Measure/M1/$submit-data"
+        assert stu5_url == "http://mcs/Measure/$deqm-submit-data"
+        assert base_url != stu5_url
+
+    async def test_409_conflict_retries_and_succeeds(self):
+        """F12: an incidental HAPI ResourceVersionConflictException (409) —
+        e.g. a patient's own resources racing a concurrent read/write on the
+        same server — is retried once rather than failing the patient
+        outright. (The primary source of these conflicts, every patient
+        upserting the same shared Organization/lenny-reporter, is fixed
+        upstream: that resource is now PUT once per job, not inlined per
+        patient — see workflows.build_submission_workflow.)"""
+        post = AsyncMock(
+            side_effect=[
+                _make_response(409, {"resourceType": "OperationOutcome"}),
+                _make_response(200, {"resourceType": "Bundle"}),
+            ]
+        )
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, post=post)
+            with patch("app.services.fhir_client.asyncio.sleep", new=AsyncMock()) as sleep:
+                await submit_data(
+                    mcs_url="http://mcs",
+                    parameters={"resourceType": "Parameters"},
+                    mode=SUBMIT_DATA_MODE_BASE,
+                    measure_id="M1",
+                )
+        assert post.await_count == 2
+        sleep.assert_awaited_once()
+
+    async def test_412_conflict_also_retries(self):
+        post = AsyncMock(
+            side_effect=[
+                _make_response(412, {"resourceType": "OperationOutcome"}),
+                _make_response(200, {"resourceType": "Bundle"}),
+            ]
+        )
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, post=post)
+            with patch("app.services.fhir_client.asyncio.sleep", new=AsyncMock()):
+                await submit_data(
+                    mcs_url="http://mcs",
+                    parameters={"resourceType": "Parameters"},
+                    mode=SUBMIT_DATA_MODE_BASE,
+                    measure_id="M1",
+                )
+        assert post.await_count == 2
+
+    async def test_409_conflict_exhausts_retries_and_raises(self):
+        """After 1 retry (2 total attempts) a persistent 409 still raises."""
+        post = AsyncMock(return_value=_make_response(409, {"resourceType": "OperationOutcome"}))
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, post=post)
+            with patch("app.services.fhir_client.asyncio.sleep", new=AsyncMock()):
+                with pytest.raises(FhirOperationError) as exc_info:
+                    await submit_data(
+                        mcs_url="http://mcs",
+                        parameters={"resourceType": "Parameters"},
+                        mode=SUBMIT_DATA_MODE_BASE,
+                        measure_id="M1",
+                    )
+        assert exc_info.value.status_code == 409
+        assert post.await_count == 2
+
+    async def test_raises_fhir_operation_error_on_4xx(self):
+        oo = {
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "invalid", "diagnostics": "bad payload"}],
+        }
+        post = AsyncMock(return_value=_make_response(400, oo))
+        with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+            _mock_async_client(mock_httpx, post=post)
+            with pytest.raises(FhirOperationError) as exc_info:
+                await submit_data(
+                    mcs_url="http://mcs",
+                    parameters={"resourceType": "Parameters"},
+                    mode=SUBMIT_DATA_MODE_BASE,
+                    measure_id="M1",
+                )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.operation == "submit-data"
+
+
+async def test_data_requirements_cached_across_patients():
+    """$data-requirements is called once per job, not once per patient.
+
+    Calling it per patient compiles the measure's CQL in the engine for every
+    patient; at 319 patients that drove the measure engine past its container
+    memory limit and got it OOM-killed mid-job.
+    """
+    data_req_response = {
+        "resourceType": "Library",
+        "dataRequirement": [{"type": "Patient"}],
+    }
+    calls: list[str] = []
+
+    async def mock_get(url, **kwargs):
+        calls.append(url)
+        if "$data-requirements" in url:
+            return _make_response(200, data_req_response)
+        if "Patient/" in url:
+            return _make_response(200, {"resourceType": "Patient", "id": "p"})
+        return _make_response(404, {})
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        for pid in ("p1", "p2", "p3"):
+            await strategy.gather_patient_data("http://cdr/fhir", pid, {})
+
+    assert sum("$data-requirements" in c for c in calls) == 1
+
+
+async def test_data_requirements_cached_under_concurrent_first_callers():
+    """Concurrent first patients do not each issue the same expensive call."""
+    data_req_response = {
+        "resourceType": "Library",
+        "dataRequirement": [{"type": "Patient"}],
+    }
+    calls: list[str] = []
+
+    async def mock_get(url, **kwargs):
+        calls.append(url)
+        if "$data-requirements" in url:
+            await asyncio.sleep(0.01)  # widen the window a stampede would use
+            return _make_response(200, data_req_response)
+        if "Patient/" in url:
+            return _make_response(200, {"resourceType": "Patient", "id": "p"})
+        return _make_response(404, {})
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        await asyncio.gather(*(strategy.gather_patient_data("http://cdr/fhir", f"p{i}", {}) for i in range(8)))
+
+    assert sum("$data-requirements" in c for c in calls) == 1
+
+
+async def test_data_requirements_failure_is_not_cached():
+    """A transient $data-requirements failure must not pin the job to $everything."""
+    attempts = {"n": 0}
+
+    async def mock_get(url, **kwargs):
+        if "$data-requirements" in url:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return _make_response(500, {})
+            return _make_response(200, {"resourceType": "Library", "dataRequirement": [{"type": "Patient"}]})
+        if "$everything" in url:
+            return _make_response(200, {"resourceType": "Bundle", "type": "searchset", "entry": [], "link": []})
+        if "Patient/" in url:
+            return _make_response(200, {"resourceType": "Patient", "id": "p"})
+        return _make_response(404, {})
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        await strategy.gather_patient_data("http://cdr/fhir", "p1", {})  # fails -> $everything
+        await strategy.gather_patient_data("http://cdr/fhir", "p2", {})  # retries, succeeds
+
+    assert attempts["n"] == 2
+
+
+async def test_filtered_query_failure_retries_unfiltered():
+    """A code:in= filter the CDR cannot resolve must not silently drop the type.
+
+    HAPI returns HAPI-2788 "Unknown ValueSet" for VSAC canonicals it never
+    loaded. Treating that as "no resources of this type" cost nine patients
+    their CMS130 denominator-exclusion while the job still reported success.
+    """
+    data_req = {
+        "resourceType": "Library",
+        "dataRequirement": [
+            {
+                "type": "ServiceRequest",
+                "codeFilter": [{"path": "code", "valueSet": "http://cts.nlm.nih.gov/fhir/ValueSet/1.2.3"}],
+            }
+        ],
+    }
+    seen: list[str] = []
+
+    async def mock_get(url, **kwargs):
+        seen.append(url)
+        if "$data-requirements" in url:
+            return _make_response(200, data_req)
+        if "Patient/p1" in url and "ServiceRequest" not in url:
+            return _make_response(200, {"resourceType": "Patient", "id": "p1"})
+        if "ServiceRequest" in url:
+            if "code:in=" in url:
+                return _make_response(400, {"resourceType": "OperationOutcome"})
+            return _make_response(
+                200,
+                {
+                    "resourceType": "Bundle",
+                    "type": "searchset",
+                    "entry": [{"resource": {"resourceType": "ServiceRequest", "id": "sr1"}}],
+                    "link": [],
+                },
+            )
+        return _make_response(404, {})
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        result = await strategy.gather_patient_data("http://cdr/fhir", "p1", {})
+
+    types = {r["resourceType"] for r in result.resources}
+    assert "ServiceRequest" in types, "unfiltered retry should have recovered the resource"
+    assert result.failed_types == [], "a recovered type must not be reported as a partial failure"
+    assert any("code:in=" in u for u in seen), "filtered query should be attempted first"
+
+
+async def test_filtered_retry_does_not_duplicate_on_partial_pagination():
+    """A failure part-way through pagination must not leave half a page behind."""
+    data_req = {
+        "resourceType": "Library",
+        "dataRequirement": [{"type": "Observation", "codeFilter": [{"path": "code", "valueSet": "http://vs/1"}]}],
+    }
+    page1 = {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [{"resource": {"resourceType": "Observation", "id": "o1"}}],
+        "link": [{"relation": "next", "url": "http://cdr/fhir/Observation?page=2&code:in=http://vs/1"}],
+    }
+
+    async def mock_get(url, **kwargs):
+        if "$data-requirements" in url:
+            return _make_response(200, data_req)
+        if "Patient/p1" in url and "Observation" not in url:
+            return _make_response(200, {"resourceType": "Patient", "id": "p1"})
+        if "Observation" in url:
+            if "code:in=" in url:
+                # first page succeeds, second page blows up mid-pagination
+                return _make_response(200, page1) if "page=2" not in url else _make_response(500, {})
+            return _make_response(
+                200,
+                {
+                    "resourceType": "Bundle",
+                    "type": "searchset",
+                    "entry": [{"resource": {"resourceType": "Observation", "id": "o1"}}],
+                    "link": [],
+                },
+            )
+        return _make_response(404, {})
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        result = await strategy.gather_patient_data("http://cdr/fhir", "p1", {})
+
+    obs = [r for r in result.resources if r["resourceType"] == "Observation"]
+    assert len(obs) == 1, f"expected the partial page to be discarded, got {obs}"
+
+
+async def test_unfiltered_query_failure_still_reported():
+    """When even the unfiltered retry fails, the type is still a partial failure."""
+    data_req = {
+        "resourceType": "Library",
+        "dataRequirement": [
+            {"type": "Condition", "codeFilter": [{"path": "code", "valueSet": "http://vs/1"}]},
+            {"type": "Encounter"},
+        ],
+    }
+
+    async def mock_get(url, **kwargs):
+        if "$data-requirements" in url:
+            return _make_response(200, data_req)
+        if "Patient/p1" in url and "Condition" not in url and "Encounter" not in url:
+            return _make_response(200, {"resourceType": "Patient", "id": "p1"})
+        if "Condition" in url:
+            return _make_response(500, {})
+        if "Encounter" in url:
+            return _make_response(200, {"resourceType": "Bundle", "type": "searchset", "entry": [], "link": []})
+        return _make_response(404, {})
+
+    with patch("app.services.fhir_client.httpx.AsyncClient") as mock_httpx:
+        mock_ctx = AsyncMock()
+        mock_ctx.get = AsyncMock(side_effect=mock_get)
+        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_ctx)
+        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        strategy = DataRequirementsStrategy("m1", mcs_url="http://mcs/fhir")
+        result = await strategy.gather_patient_data("http://cdr/fhir", "p1", {})
+
+    assert [f.resource_type for f in result.failed_types] == ["Condition"]
