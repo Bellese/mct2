@@ -23,6 +23,18 @@ All notable changes to this project will be documented in this file.
 - **Three narrower issues in the DEQM path are known and deferred**, none of which affect direct load: a rejected submission can be misread as "server doesn't support STU5" and silently switch the job's wire format mid-run while the on-screen badge keeps claiming the original (#414); a rejection returned inside an HTTP 200 response is currently counted as a successful transfer (#415); and `direct_load` behaves differently than before if you have set `PATIENT_DATA_STRATEGY=data_requirements`, which is not the default (#416).
 - **DEQM has not been exercised at production's memory settings.** The workflow is verified against the local and CI measure engine, which now runs an 8 GB container around a 4 GB heap. Production runs that same server at 4 GB around a 2 GB heap — half the heap the memory failure above was observed with — and raising it is not a change this release can safely make, because production is a single 8 GiB host already declaring 7 GB across its two FHIR servers. If a DEQM job does exhaust memory there, the failure is a kernel kill with no Java error and no heapdump, and it takes down the measure engine shared by every other job. Sizing that host is tracked separately. (#412)
 
+## [0.2.0.0] - 2026-09-07
+
+### Added
+- **A Patients page that shows the patient cohorts on the CDR you are connected to.** Point Lenny at a CDR it has never seen — a connectathon participant's own server, say — and the Patients page lists every Group on it with its id, type and size, searchable by name or id. Previously the only way to see Groups was a page hidden behind an admin flag that was off by default, and which deliberately showed *only* Groups carrying a CQL expression: on a server whose cohorts are plain Groups, the page you had to switch on to find your cohorts would then tell you there were none. The new page hides nothing. If the server genuinely has no Groups it says so, names the server, and points you at "All patients" under Jobs → New calculation, because measures still run without cohorts. (#404)
+
+### Fixed
+- **The patient group dropdown now follows the CDR you switched to.** The "New calculation" form builds its patient-group list from the CDR, but only refreshed it when the *measure engine* changed. Activating a different CDR in Settings left the previous CDR's groups on offer, so picking one and submitting produced a job aimed at a group id that does not exist on your server. Nothing on screen said the list was stale. (#404, same bug class as #397 with the two connections swapped)
+- **A cohort that states its size instead of listing its members no longer reads as empty.** A FHIR Group may carry `quantity` rather than an enumerated `member` list. Lenny counted only members, so such a cohort showed as having none. Sizes now fall back to `quantity`, and a Group that states neither shows "—" rather than a confident "0". (#404)
+
+### Changed
+- **`groups_enabled` no longer gates listing Groups — only the unreleased `$evaluate` operation.** Listing is always available. (#404)
+
 ## [0.0.22.0] - 2026-08-20
 
 ### Fixed

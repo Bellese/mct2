@@ -327,8 +327,9 @@ export function getJobComparison(jobId) {
   return request(`/jobs/${jobId}/comparison`);
 }
 
-// Groups (experimental, issue #322)
-export function getEvaluatableGroups() {
+// CDR patient Groups — the Patients module (#404). Returns every Group on the
+// active CDR, not only the CQL-evaluatable ones.
+export function getPatientGroups() {
   return request('/api/groups');
 }
 

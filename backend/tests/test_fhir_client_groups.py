@@ -327,3 +327,78 @@ async def test_evaluate_zero_members_returns_empty_list():
     assert result["group_id"] == "g1"
     assert result["member_count"] == 0
     assert result["members"] == []
+
+
+# ---------------------------------------------------------------------------
+# list_groups — the unfiltered listing behind the Patients module (issue #404)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_groups_returns_every_group_unfiltered():
+    """Unlike list_groups_with_expression, this returns Groups with no CQL expression."""
+    from app.services.fhir_client import list_groups
+
+    plain_group = {"resourceType": "Group", "id": "g1", "name": "Plain Cohort", "type": "person"}
+    cql_group = {
+        "resourceType": "Group",
+        "id": "g2",
+        "name": "CQL Cohort",
+        "type": "person",
+        "extension": [
+            {
+                "url": CQL_EXTENSION_URL,
+                "valueExpression": {"language": "text/cql-expression", "expression": "Patient.active"},
+            }
+        ],
+    }
+
+    patcher = _patch_async_client(_make_response(200, _bundle([plain_group, cql_group])))
+    try:
+        out = await list_groups("http://cdr.example", {})
+    finally:
+        patcher.stop()
+
+    assert [g["id"] for g in out] == ["g1", "g2"]
+
+
+async def test_list_groups_returns_quantity():
+    """`quantity` is surfaced so a cohort sized only that way is not shown as empty."""
+    from app.services.fhir_client import list_groups
+
+    group = {
+        "resourceType": "Group",
+        "id": "g1",
+        "name": "Characteristic Cohort",
+        "type": "person",
+        "quantity": 319,
+    }
+
+    patcher = _patch_async_client(_make_response(200, _bundle([group])))
+    try:
+        out = await list_groups("http://cdr.example", {})
+    finally:
+        patcher.stop()
+
+    assert out[0]["quantity"] == 319
+
+
+async def test_list_groups_quantity_is_none_when_absent():
+    """A Group with members but no `quantity` reports quantity None, not 0."""
+    from app.services.fhir_client import list_groups
+
+    group = {
+        "resourceType": "Group",
+        "id": "g1",
+        "name": "Enumerated Cohort",
+        "type": "person",
+        "member": [{"entity": {"reference": "Patient/p1"}}, {"entity": {"reference": "Patient/p2"}}],
+    }
+
+    patcher = _patch_async_client(_make_response(200, _bundle([group])))
+    try:
+        out = await list_groups("http://cdr.example", {})
+    finally:
+        patcher.stop()
+
+    assert out[0]["member_count"] == 2
+    assert out[0]["quantity"] is None

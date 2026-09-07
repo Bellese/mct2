@@ -3,6 +3,7 @@
     { "source": "/", "destination": "/index.html" },
     { "source": "/measures", "destination": "/index.html" },
     { "source": "/jobs", "destination": "/index.html" },
+    { "source": "/patients", "destination": "/index.html" },
     { "source": "/groups", "destination": "/index.html" },
     { "source": "/results", "destination": "/index.html" },
     { "source": "/results/:jobId", "destination": "/index.html" },
