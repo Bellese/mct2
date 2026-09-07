@@ -21,18 +21,17 @@ from app.models.config import CDRConfig
 from app.models.job import Batch, BatchStatus, Job, JobStatus, MeasureResult
 from app.services.fhir_client import (
     BatchQueryStrategy,
-    DataRequirementsStrategy,
     FhirOperationError,
     _build_auth_headers,
     evaluate_measure,
     get_group_members,
-    push_resources,
     snapshot_evaluated_resources,
     wipe_patient_data,
     wipe_patients_by_id,
 )
 from app.services.fhir_errors import redact_outcome, sanitize_url
 from app.services.validation import sanitize_error
+from app.services.workflows import SubmissionWorkflow, TransferPhaseError, build_submission_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -132,18 +131,6 @@ def _error_measure_report(
     }
 
 
-def _patient_data_strategy(measure_id: str, mcs_url: str, mcs_auth_headers: dict[str, str] | None = None):
-    """Create the configured patient data acquisition strategy.
-
-    `mcs_url`/`mcs_auth_headers` are threaded through to DataRequirementsStrategy so
-    `$data-requirements` asks the job's own measure engine rather than the env-var
-    default (issue #397). BatchQueryStrategy ignores them — it only talks to the CDR.
-    """
-    if settings.PATIENT_DATA_STRATEGY == "data_requirements":
-        return DataRequirementsStrategy(measure_id, mcs_url, mcs_auth_headers)
-    return BatchQueryStrategy()
-
-
 async def _stop_or_delete_job(job_id: int) -> bool:
     """Return True when work should stop because the job was cancelled or deleted."""
     async with async_session() as session:
@@ -193,8 +180,15 @@ async def run_job(job_id: int) -> None:
 
         # Step 3: Fetch patients from CDR (optionally filtered by Group)
         async with async_session() as session:
-            job_for_group = await session.get(Job, job_id)
-            group_id = job_for_group.group_id if job_for_group else None
+            job_row = await session.get(Job, job_id)
+            if not job_row:
+                return
+            group_id = job_row.group_id
+            job_workflow = job_row.workflow
+            job_submit_data_mode = job_row.submit_data_mode
+            job_measure_id = job_row.measure_id
+            job_period_start = job_row.period_start
+            job_period_end = job_row.period_end
 
         if group_id:
             logger.info("Gathering patients from Group", extra={"job_id": job_id, "group_id": group_id})
@@ -222,6 +216,23 @@ async def run_job(job_id: int) -> None:
         patient_ids = list(patient_map.keys())
         batch_size = settings.BATCH_SIZE
 
+        # Build the submission workflow once per job, BEFORE the wipe below. For
+        # DEQM this reads the measure canonical off the MCS; failure aborts the
+        # job before any patient work — including before the wipe — so a
+        # canonical-fetch failure no longer wipes the MCS and then fails
+        # anyway. Everything this needs (mcs_url/auth, measure_id, period) was
+        # already resolved above; it doesn't need patient_ids.
+        workflow = await build_submission_workflow(
+            workflow=job_workflow,
+            job_id=job_id,
+            measure_id=job_measure_id,
+            mcs_url=mcs_url,
+            mcs_auth_headers=mcs_auth_headers,
+            submit_data_mode=job_submit_data_mode,
+            period_start=job_period_start,
+            period_end=job_period_end,
+        )
+
         # Step 4a: Clear the prior run's data off the MCS (issue #392).
         #
         # This sits after the gather and before the push, not at the top of the
@@ -238,6 +249,14 @@ async def run_job(job_id: int) -> None:
             mcs_auth_headers=mcs_auth_headers,
             patient_ids=patient_ids,
         )
+
+        # Stage workflow prerequisites AFTER the wipe, never before. The wipe's
+        # full-wipe branch deletes Organization, so the DEQM reporter has to be
+        # (re)created on this side of it -- otherwise every MeasureReport in the
+        # job references an Organization that was just deleted, and because
+        # $submit-data is transaction-backed that fails each patient's whole
+        # submission. No-op for direct_load.
+        await workflow.ensure_target_prerequisites()
 
         # The cancellation check that already guarded the batch-creation block
         # below now also covers the wipe above — no second check needed.
@@ -278,6 +297,7 @@ async def run_job(job_id: int) -> None:
                     auth_headers=auth_headers,
                     mcs_url=mcs_url,
                     mcs_auth_headers=mcs_auth_headers,
+                    workflow=workflow,
                 )
 
         # Check for cancellation before starting
@@ -297,29 +317,47 @@ async def run_job(job_id: int) -> None:
                 return
             if job.total_patients and job.processed_patients == 0 and job.failed_patients > 0:
                 job.status = JobStatus.failed
+                # Aggregate over every phase that can fail a patient, not just
+                # "evaluate" — a DEQM job where every patient fails at submit
+                # was previously reported as an evaluation failure with no
+                # diagnostic at all (F5).
                 error_rows = (
-                    (
-                        await session.execute(
-                            select(MeasureResult.populations).where(
-                                MeasureResult.job_id == job_id,
-                                MeasureResult.error_phase == "evaluate",
-                            )
+                    await session.execute(
+                        select(MeasureResult.error_phase, MeasureResult.populations).where(
+                            MeasureResult.job_id == job_id,
+                            MeasureResult.error_phase.in_(("evaluate", "submit", "gather")),
                         )
                     )
-                    .scalars()
-                    .all()
-                )
+                ).all()
+                phase_counts: dict[str, int] = {}
+                for phase, _pop in error_rows:
+                    if phase:
+                        phase_counts[phase] = phase_counts.get(phase, 0) + 1
+                dominant_phase = max(phase_counts, key=phase_counts.get) if phase_counts else "evaluate"
                 patient_errors = [
-                    r["error_message"] for r in error_rows if isinstance(r, dict) and r.get("error_message")
+                    pop["error_message"]
+                    for phase, pop in error_rows
+                    if phase == dominant_phase and isinstance(pop, dict) and pop.get("error_message")
                 ]
-                vs_urls = _extract_unknown_valueset_urls(patient_errors) if patient_errors else []
-                if vs_urls:
-                    vs_list = ", ".join(vs_urls)
-                    job.error_message = (
-                        f"All {job.failed_patients} patient evaluations failed: unknown ValueSet(s): {vs_list}"
-                    )
+                if dominant_phase == "evaluate":
+                    # Keep the existing unknown-ValueSet special case working
+                    # for the evaluate phase only.
+                    vs_urls = _extract_unknown_valueset_urls(patient_errors) if patient_errors else []
+                    if vs_urls:
+                        vs_list = ", ".join(vs_urls)
+                        job.error_message = (
+                            f"All {job.failed_patients} patient evaluations failed: unknown ValueSet(s): {vs_list}"
+                        )
+                    else:
+                        job.error_message = f"All {job.failed_patients} patient evaluations failed"
                 else:
-                    job.error_message = f"All {job.failed_patients} patient evaluations failed"
+                    phase_word = {"submit": "submissions", "gather": "data gathers"}[dominant_phase]
+                    if patient_errors:
+                        job.error_message = (
+                            f"All {job.failed_patients} patient {phase_word} failed: {patient_errors[0]}"
+                        )
+                    else:
+                        job.error_message = f"All {job.failed_patients} patient {phase_word} failed"
             else:
                 job.status = JobStatus.complete
             job.completed_at = datetime.now(timezone.utc)
@@ -463,13 +501,19 @@ async def _process_single_batch(
     auth_headers: dict[str, str],
     mcs_url: str,
     mcs_auth_headers: dict[str, str] | None = None,
+    *,
+    workflow: SubmissionWorkflow,
 ) -> None:
     """Process a single batch in two phases.
 
-    Phase 1 — GATHER & PUSH: Fetch each patient's data from the CDR and push
-    it to the measure engine.  HAPI FHIR's synchronous indexing strategy
+    Phase 1 — TRANSFER: Delegate to `workflow.transfer_patient()` for each
+    patient. `direct_load` gathers from the CDR and pushes a Bundle of PUTs
+    straight to the measure engine; `deqm_submit_data` gathers via targeted
+    `$data-requirements` queries and delivers via `Measure/$submit-data`
+    instead. Either way, HAPI FHIR's synchronous indexing strategy
     (synchronization.strategy=sync) ensures resources are immediately
-    searchable after each push — no post-push wait needed.
+    searchable once the workflow's delivery step returns — no post-transfer
+    wait needed.
 
     Phase 2 — EVALUATE: Call $evaluate-measure for each patient.  Because all
     patient data is already indexed, CQL evaluation sees the correct resources.
@@ -500,14 +544,24 @@ async def _process_single_batch(
                 period_start = job.period_start
                 period_end = job.period_end
 
-            strategy = _patient_data_strategy(measure_id, mcs_url, mcs_auth_headers)
+            # DEQM jobs always use DataRequirementsStrategy regardless of the
+            # env-configured default (see workflows._acquisition_strategy) —
+            # only direct_load's strategy is actually chosen by that setting.
+            strategy_label = settings.PATIENT_DATA_STRATEGY if workflow.name == "direct_load" else "data_requirements"
             logger.info(
-                "Using patient data strategy",
-                extra={"strategy": settings.PATIENT_DATA_STRATEGY, "job_id": job_id, "batch_id": batch_id},
+                "Using submission workflow",
+                extra={
+                    "workflow": workflow.name,
+                    "strategy": strategy_label,
+                    "job_id": job_id,
+                    "batch_id": batch_id,
+                },
             )
 
             # ----------------------------------------------------------
-            # Phase 1: Gather all patient data and push to measure engine
+            # Phase 1: Gather this batch's patient data and deliver it to
+            # the MCS via workflow.transfer_patient() — direct_load pushes a
+            # Bundle of PUTs; deqm_submit_data POSTs a $submit-data envelope.
             # ----------------------------------------------------------
             # Track patients that FULLY failed gather so they are skipped in evaluate.
             # Partial-gather patients proceed to evaluate with available data (AT-2).
@@ -522,15 +576,9 @@ async def _process_single_batch(
                     return
 
                 try:
-                    gather_result = await strategy.gather_patient_data(cdr_url, patient_id, auth_headers)
-                    if gather_result.resources:
-                        await push_resources(
-                            gather_result.resources,
-                            target_url=mcs_url,
-                            auth_headers=mcs_auth_headers,
-                        )
+                    gather_result = await workflow.transfer_patient(cdr_url, patient_id, auth_headers)
                     logger.info(
-                        f"Pushed {len(gather_result.resources)} resources for {patient_id[:8]}",
+                        f"Transferred {len(gather_result.resources)} resources for {patient_id[:8]}",
                         extra={"job_id": job_id, "patient_id": patient_id},
                     )
 
@@ -555,11 +603,17 @@ async def _process_single_batch(
                             },
                         )
 
-                except Exception as push_exc:
+                except Exception as transfer_exc:
+                    if isinstance(transfer_exc, TransferPhaseError):
+                        error_phase = transfer_exc.phase
+                        push_exc: Exception = transfer_exc.cause
+                    else:
+                        error_phase = "gather"
+                        push_exc = transfer_exc
                     gather_failed_patients.add(patient_id)
                     patient_name = _extract_patient_name(patient_map.get(patient_id, {}))
                     sanitized_msg = sanitize_error(push_exc)
-                    error_details: dict[str, Any] = {"operation": "gather", "error": sanitized_msg}
+                    error_details: dict[str, Any] = {"operation": error_phase, "error": sanitized_msg}
                     if isinstance(push_exc, FhirOperationError):
                         error_details["url"] = push_exc.url
                         error_details["status_code"] = push_exc.status_code
@@ -572,12 +626,13 @@ async def _process_single_batch(
                         push_exc.outcome.raw if isinstance(push_exc, FhirOperationError) and push_exc.outcome else None,
                     )
                     logger.warning(
-                        "Failed to gather/push patient data",
+                        "Failed to transfer patient data",
                         extra={
                             "job_id": job_id,
                             "batch_id": batch_id,
                             "patient_id": patient_id,
                             "error": sanitized_msg,
+                            "error_phase": error_phase,
                         },
                     )
                     if await _stop_or_delete_job(job_id):
@@ -601,10 +656,10 @@ async def _process_single_batch(
                                 "numerator_exclusion": False,
                                 "error": True,
                                 "error_message": sanitized_msg,
-                                "error_phase": "gather",
+                                "error_phase": error_phase,
                             }
                             existing_row.error_details = error_details
-                            existing_row.error_phase = "gather"
+                            existing_row.error_phase = error_phase
                         else:
                             result = MeasureResult(
                                 job_id=job_id,
@@ -619,10 +674,10 @@ async def _process_single_batch(
                                     "numerator_exclusion": False,
                                     "error": True,
                                     "error_message": sanitized_msg,
-                                    "error_phase": "gather",
+                                    "error_phase": error_phase,
                                 },
                                 error_details=error_details,
-                                error_phase="gather",
+                                error_phase=error_phase,
                             )
                             session.add(result)
                         await session.commit()

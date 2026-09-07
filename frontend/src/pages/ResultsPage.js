@@ -486,6 +486,11 @@ export default function ResultsPage() {
         group_id: selectedJob.group_id || undefined,
         period_start: selectedJob.period_start || undefined,
         period_end: selectedJob.period_end || undefined,
+        // Carry the original job's submission workflow. Omitting it let the
+        // backend default (direct_load) win, so re-running a DEQM job silently
+        // produced a direct-load job -- same measure, same period, different
+        // delivery path, with nothing on screen saying so.
+        workflow: selectedJob.workflow || undefined,
       });
       toast.success('Re-run started — check the Jobs page');
       navigate('/jobs');
@@ -546,6 +551,7 @@ export default function ResultsPage() {
     const phaseLabel = errorPhase === 'gather'         ? "Couldn't fetch patient data"
       : errorPhase === 'gather_partial' ? 'Some data missing'
       : errorPhase === 'evaluate'       ? 'Calculation failed'
+      : errorPhase === 'submit'         ? "Couldn't submit patient data to the measure server"
       : (r.populations?.error === true || r.status === 'error') ? 'Unknown error'
       : null;
     return {
