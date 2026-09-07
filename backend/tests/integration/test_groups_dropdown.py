@@ -131,7 +131,9 @@ async def test_api_groups_returns_every_seeded_group_unfiltered(integration_clie
 
 
 @pytest.mark.asyncio
-async def test_api_groups_follows_the_active_cdr(integration_client, db_session, measure_url: str) -> None:
+async def test_api_groups_follows_the_active_cdr(
+    integration_client, db_session, truncate_tables, measure_url: str
+) -> None:
     """Activating a different CDR changes what GET /api/groups returns.
 
     Criterion (b): run a measure against the Groups on the CDR you are actually
@@ -139,6 +141,11 @@ async def test_api_groups_follows_the_active_cdr(integration_client, db_session,
     Groups (asserted above), so activating it as the CDR must yield a list that
     no longer contains them — proving the endpoint follows the active row
     rather than a process-wide default.
+
+    `truncate_tables` is required, not decorative: this test writes an active
+    cdr_configs row, and db_session does not roll back despite its docstring.
+    Without the truncate, every later test in the run would silently be pointed
+    at the measure engine as its CDR.
     """
     from sqlalchemy import update as sa_update
 

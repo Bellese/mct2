@@ -115,6 +115,19 @@ describe('PatientsPage — listing cohorts on the active CDR (#404)', () => {
     expect(screen.queryByText(/empty/i)).not.toBeInTheDocument();
   });
 
+  test('a Group explicitly stating quantity 0 renders 0, not a dash', async () => {
+    api.getPatientGroups = jest.fn().mockResolvedValue({
+      groups: [{ id: 'g1', name: 'Genuinely Empty Cohort', type: 'person', member_count: 0, quantity: 0 }],
+    });
+
+    render(<Harness />);
+
+    expect(await screen.findByText('Genuinely Empty Cohort')).toBeInTheDocument();
+    // A server that says "this cohort has zero patients" is telling us
+    // something; a dash would throw that answer away.
+    expect(screen.getByTestId('member-count-g1')).toHaveTextContent('0');
+  });
+
   test('a Group with neither members nor quantity renders an honest dash, not 0', async () => {
     api.getPatientGroups = jest.fn().mockResolvedValue({
       groups: [{ id: 'g1', name: 'Unknown Size Cohort', type: 'person', member_count: 0, quantity: null }],

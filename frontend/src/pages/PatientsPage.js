@@ -11,8 +11,9 @@ import styles from './PatientsPage.module.css';
 // a confident "0" on somebody's real cohort (#404).
 export function memberCountLabel(group) {
   if (group.member_count) return String(group.member_count);
+  // `quantity: 0` is an answer, not a gap — it falls through here and renders
+  // "0" rather than a dash.
   if (group.quantity != null) return String(group.quantity);
-  if (group.member_count === 0 && group.quantity === 0) return '0';
   return '—';
 }
 
