@@ -20,6 +20,7 @@ from app.services.orchestrator import (
     _get_mcs_auth_headers,
     run_job,
 )
+from app.services.workflows import SubmissionWorkflow, TransferPhaseError
 
 pytestmark = pytest.mark.asyncio
 
@@ -205,7 +206,7 @@ async def test_run_job_happy_path(test_session, session_factory, mock_measure_re
                 ]
             ),
         ),
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch(
             "app.services.orchestrator.evaluate_measure",
             new_callable=AsyncMock,
@@ -279,7 +280,7 @@ async def test_run_job_stores_empty_list_when_snapshot_helper_returns_none(
             new_callable=AsyncMock,
             return_value=GatherResult(resources=[{"resourceType": "Patient", "id": "p1"}]),
         ),
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch(
             "app.services.orchestrator.evaluate_measure",
             new_callable=AsyncMock,
@@ -328,7 +329,7 @@ async def test_run_job_stores_none_when_snapshot_helper_raises(test_session, ses
             new_callable=AsyncMock,
             return_value=GatherResult(resources=[{"resourceType": "Patient", "id": "p1"}]),
         ),
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch(
             "app.services.orchestrator.evaluate_measure",
             new_callable=AsyncMock,
@@ -505,7 +506,7 @@ def _wipe_mode_patches(session_factory, patients, mock_measure_report):
         _make_session_factory_patch(session_factory),
         patch("app.services.orchestrator.wipe_patient_data", new_callable=AsyncMock),
         patch("app.services.orchestrator.wipe_patients_by_id", new_callable=AsyncMock),
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch("app.services.orchestrator._get_cdr_auth_headers", new_callable=AsyncMock, return_value={}),
         patch(
             "app.services.orchestrator._get_cdr_url",
@@ -663,7 +664,7 @@ async def test_run_job_partial_patient_failure(test_session, session_factory, mo
             new_callable=AsyncMock,
             return_value=GatherResult(resources=[{"resourceType": "Patient", "id": "p1"}]),
         ),
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch(
             "app.services.orchestrator.evaluate_measure",
             new_callable=AsyncMock,
@@ -716,7 +717,7 @@ async def test_run_job_all_patient_failures_marks_job_failed(test_session, sessi
             new_callable=AsyncMock,
             return_value=GatherResult(resources=[{"resourceType": "Patient", "id": "p1"}]),
         ),
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch(
             "app.services.orchestrator.evaluate_measure",
             new_callable=AsyncMock,
@@ -812,7 +813,7 @@ async def test_run_job_all_hapi_2788_produces_valueset_job_message(test_session,
             new_callable=AsyncMock,
             return_value=GatherResult(resources=[{"resourceType": "Patient", "id": "p1"}]),
         ),
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch("app.services.orchestrator.evaluate_measure", new_callable=AsyncMock, side_effect=fhir_err),
     ):
         await run_job(job_id)
@@ -936,7 +937,8 @@ async def test_orchestrator_returns_empty_headers_when_auth_type_is_none_string(
 
 
 async def test_process_batch_uses_everything_strategy(test_session, session_factory, monkeypatch):
-    """_process_single_batch uses $everything by default for complete patient graphs."""
+    """DirectLoadWorkflow selects BatchQueryStrategy ($everything) by default;
+    _process_single_batch just drives the pre-built workflow it's handed."""
     from unittest.mock import MagicMock
 
     from app.models.job import Batch, BatchStatus
@@ -967,10 +969,12 @@ async def test_process_batch_uses_everything_strategy(test_session, session_fact
 
     patient_map = {"p1": {"resourceType": "Patient", "id": "p1"}}
 
+    from app.services.workflows import DirectLoadWorkflow
+
     with (
         _make_session_factory_patch(session_factory),
-        patch("app.services.orchestrator.BatchQueryStrategy") as mock_strategy_cls,
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.BatchQueryStrategy") as mock_strategy_cls,
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch(
             "app.services.orchestrator.evaluate_measure",
             new_callable=AsyncMock,
@@ -997,6 +1001,7 @@ async def test_process_batch_uses_everything_strategy(test_session, session_fact
         )
         mock_strategy_cls.return_value = mock_strategy
 
+        workflow = DirectLoadWorkflow("CMS999", "http://mcs/fhir", None)
         await _process_single_batch(
             job_id=job.id,
             batch_id=batch.id,
@@ -1004,6 +1009,7 @@ async def test_process_batch_uses_everything_strategy(test_session, session_fact
             cdr_url="http://cdr/fhir",
             auth_headers={},
             mcs_url="http://mcs/fhir",
+            workflow=workflow,
         )
 
     mock_strategy_cls.assert_called_once_with()
@@ -1012,7 +1018,8 @@ async def test_process_batch_uses_everything_strategy(test_session, session_fact
 async def test_process_batch_uses_data_requirements_strategy_when_configured(
     test_session, session_factory, monkeypatch
 ):
-    """_process_single_batch can be rolled back to DataRequirementsStrategy by env config."""
+    """DirectLoadWorkflow can be rolled back to DataRequirementsStrategy by env
+    config; _process_single_batch just drives the pre-built workflow it's handed."""
     from unittest.mock import MagicMock
 
     from app.models.job import Batch, BatchStatus
@@ -1043,10 +1050,12 @@ async def test_process_batch_uses_data_requirements_strategy_when_configured(
 
     patient_map = {"p1": {"resourceType": "Patient", "id": "p1"}}
 
+    from app.services.workflows import DirectLoadWorkflow
+
     with (
         _make_session_factory_patch(session_factory),
-        patch("app.services.orchestrator.DataRequirementsStrategy") as mock_strategy_cls,
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.DataRequirementsStrategy") as mock_strategy_cls,
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch(
             "app.services.orchestrator.evaluate_measure",
             new_callable=AsyncMock,
@@ -1071,6 +1080,7 @@ async def test_process_batch_uses_data_requirements_strategy_when_configured(
         )
         mock_strategy_cls.return_value = mock_strategy
 
+        workflow = DirectLoadWorkflow("CMS999", "http://mcs/fhir", None)
         await _process_single_batch(
             job_id=job.id,
             batch_id=batch.id,
@@ -1078,6 +1088,7 @@ async def test_process_batch_uses_data_requirements_strategy_when_configured(
             cdr_url="http://cdr/fhir",
             auth_headers={},
             mcs_url="http://mcs/fhir",
+            workflow=workflow,
         )
 
     # Issue #397: the strategy is told which MCS to ask for $data-requirements.
@@ -1119,7 +1130,7 @@ async def test_run_job_gather_failure_prevents_evaluate_call(test_session, sessi
             new_callable=AsyncMock,
             side_effect=Exception("CDR connection refused"),
         ),
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch("app.services.orchestrator.evaluate_measure", evaluate_mock),
     ):
         await run_job(job_id)
@@ -1170,7 +1181,7 @@ async def test_run_job_partial_gather_continues_to_evaluate(test_session, sessio
             return_value=partial_result,
         ),
         patch(
-            "app.services.orchestrator.push_resources",
+            "app.services.workflows.push_resources",
             new_callable=AsyncMock,
         ),
         patch("app.services.orchestrator.evaluate_measure", evaluate_mock),
@@ -1232,7 +1243,7 @@ async def test_run_job_evaluate_failure_persists_error_details_and_back_compat(
             new_callable=AsyncMock,
             return_value=GatherResult(resources=[{"resourceType": "Patient", "id": "p1"}]),
         ),
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch(
             "app.services.orchestrator.evaluate_measure",
             new_callable=AsyncMock,
@@ -1289,7 +1300,7 @@ async def test_run_job_sets_started_at_on_transition_to_running(test_session, se
                 resources=[{"resourceType": "Patient", "id": "p1"}]
             ),
         ),
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock),
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock),
         patch(
             "app.services.orchestrator.evaluate_measure",
             new_callable=AsyncMock,
@@ -1521,7 +1532,7 @@ async def test_run_job_targets_job_mcs_with_credentials(test_session, session_fa
         _make_session_factory_patch(session_factory),
         patch("app.services.orchestrator.wipe_patient_data", new_callable=AsyncMock) as mock_wipe,
         patch("app.services.orchestrator.wipe_patients_by_id", new_callable=AsyncMock) as mock_scoped_wipe,
-        patch("app.services.orchestrator.push_resources", new_callable=AsyncMock) as mock_push,
+        patch("app.services.workflows.push_resources", new_callable=AsyncMock) as mock_push,
         patch("app.services.orchestrator._get_cdr_auth_headers", new_callable=AsyncMock, return_value={}),
         patch(
             "app.services.orchestrator._get_cdr_url",
@@ -1558,3 +1569,252 @@ async def test_run_job_targets_job_mcs_with_credentials(test_session, session_fa
     # Evaluation carries the credentials that were missing in the 401 regression.
     assert mock_eval.await_args.kwargs["measure_engine_url"] == "https://mcs.example.org/fhir"
     assert mock_eval.await_args.kwargs["auth_headers"] == expected_auth
+
+
+# ---------------------------------------------------------------------------
+# Workflow wiring: TransferPhaseError unwrapping (Task 5)
+# ---------------------------------------------------------------------------
+
+
+class _StubWorkflow(SubmissionWorkflow):
+    name = "stub"
+
+    def __init__(self, outcome):
+        self._outcome = outcome  # GatherResult | Exception
+
+    async def transfer_patient(self, cdr_url, patient_id, cdr_auth_headers):
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self._outcome
+
+
+def _run_job_patches(session_factory, patients, stub_workflow):
+    """Common patch set for stubbed-workflow run_job tests."""
+    return (
+        _make_session_factory_patch(session_factory),
+        patch("app.services.orchestrator.wipe_patient_data", new_callable=AsyncMock),
+        patch("app.services.orchestrator.wipe_patients_by_id", new_callable=AsyncMock),
+        patch("app.services.orchestrator._get_cdr_auth_headers", new_callable=AsyncMock, return_value={}),
+        patch("app.services.orchestrator._get_cdr_url", new_callable=AsyncMock, return_value="http://cdr/fhir"),
+        patch.object(
+            __import__("app.services.fhir_client", fromlist=["BatchQueryStrategy"]).BatchQueryStrategy,
+            "gather_patients",
+            new_callable=AsyncMock,
+            return_value=patients,
+        ),
+        patch(
+            "app.services.orchestrator.build_submission_workflow",
+            new_callable=AsyncMock,
+            return_value=stub_workflow,
+        ),
+    )
+
+
+async def test_submit_phase_failure_recorded_as_submit(test_session, session_factory):
+    """A TransferPhaseError(phase='submit') lands in MeasureResult.error_phase and skips evaluate."""
+    job_id = await _setup_job(test_session)
+    async with session_factory() as session:
+        job = await session.get(Job, job_id)
+        job.workflow = "deqm_submit_data"
+        await session.commit()
+
+    patients = [{"resourceType": "Patient", "id": "p1", "name": [{"family": "Test"}]}]
+    stub = _StubWorkflow(TransferPhaseError("submit", RuntimeError("MCS rejected the payload")))
+
+    with contextlib.ExitStack() as stack:
+        for p in _run_job_patches(session_factory, patients, stub):
+            stack.enter_context(p)
+        mock_eval = stack.enter_context(patch("app.services.orchestrator.evaluate_measure", new_callable=AsyncMock))
+        await run_job(job_id)
+
+    mock_eval.assert_not_awaited()
+    async with session_factory() as session:
+        row = (await session.execute(select(MeasureResult).where(MeasureResult.job_id == job_id))).scalar_one()
+        assert row.error_phase == "submit"
+        assert row.populations["error_phase"] == "submit"
+        assert row.populations["error"] is True
+
+
+async def test_direct_load_gather_failure_still_recorded_as_gather(test_session, session_factory):
+    """Regression: phase labeling for direct_load transfer failures is unchanged."""
+    job_id = await _setup_job(test_session)
+    patients = [{"resourceType": "Patient", "id": "p1", "name": [{"family": "Test"}]}]
+    stub = _StubWorkflow(TransferPhaseError("gather", RuntimeError("CDR down")))
+
+    with contextlib.ExitStack() as stack:
+        for p in _run_job_patches(session_factory, patients, stub):
+            stack.enter_context(p)
+        stack.enter_context(patch("app.services.orchestrator.evaluate_measure", new_callable=AsyncMock))
+        await run_job(job_id)
+
+    async with session_factory() as session:
+        row = (await session.execute(select(MeasureResult).where(MeasureResult.job_id == job_id))).scalar_one()
+        assert row.error_phase == "gather"
+
+
+# ---------------------------------------------------------------------------
+# build_submission_workflow wiring (coverage-audit gap fill)
+# ---------------------------------------------------------------------------
+
+
+async def test_run_job_passes_job_fields_to_build_submission_workflow(test_session, session_factory):
+    """run_job must forward the job's own snapshot fields (workflow, measure_id,
+    mcs_url/auth, submit_data_mode, period) to build_submission_workflow — not
+    env defaults or another job's values. Every prior test mocks this call
+    without asserting its arguments."""
+    job_id = await _setup_job(test_session)
+    async with session_factory() as session:
+        job = await session.get(Job, job_id)
+        job.workflow = "deqm_submit_data"
+        job.submit_data_mode = "stu5"
+        job.measure_id = "measure-1"
+        job.period_start = "2024-01-01"
+        job.period_end = "2024-12-31"
+        await session.commit()
+
+    patients = [{"resourceType": "Patient", "id": "p1", "name": [{"family": "Test"}]}]
+    stub = _StubWorkflow(GatherResult(resources=[{"resourceType": "Patient", "id": "p1"}]))
+
+    with contextlib.ExitStack() as stack:
+        for p in _run_job_patches(session_factory, patients, stub):
+            stack.enter_context(p)
+        build_mock = stack.enter_context(
+            patch(
+                "app.services.orchestrator.build_submission_workflow",
+                new_callable=AsyncMock,
+                return_value=stub,
+            )
+        )
+        # Shape the return value: run_job feeds it straight into
+        # `measure_report.get("group", [])`. A bare AsyncMock hands back an
+        # unconfigured MagicMock there, which emitted "coroutine
+        # 'AsyncMockMixin._execute_mock_call' was never awaited" from the
+        # population loop. The assertion below only covers
+        # build_submission_workflow's arguments, so an empty group list is
+        # enough -- it just has to be the shape the real call returns.
+        stack.enter_context(
+            patch(
+                "app.services.orchestrator.evaluate_measure",
+                new_callable=AsyncMock,
+                return_value={"resourceType": "MeasureReport", "group": []},
+            )
+        )
+        await run_job(job_id)
+
+    build_mock.assert_awaited_once_with(
+        workflow="deqm_submit_data",
+        job_id=job_id,
+        measure_id="measure-1",
+        mcs_url=settings.MEASURE_ENGINE_URL,
+        mcs_auth_headers={},
+        submit_data_mode="stu5",
+        period_start="2024-01-01",
+        period_end="2024-12-31",
+    )
+
+
+async def test_run_job_build_submission_workflow_failure_skips_wipe_and_fails_job(test_session, session_factory):
+    """If build_submission_workflow raises (e.g. a DEQM canonical-fetch failure),
+    run_job must fail fast BEFORE the wipe — a canonical-fetch failure must not
+    wipe the MCS and then fail anyway (see orchestrator.py comment above the
+    build_submission_workflow call)."""
+    from app.services.fhir_errors import FhirOperationError
+
+    job_id = await _setup_job(test_session)
+    async with session_factory() as session:
+        job = await session.get(Job, job_id)
+        job.workflow = "deqm_submit_data"
+        await session.commit()
+
+    patients = [{"resourceType": "Patient", "id": "p1", "name": [{"family": "Test"}]}]
+
+    with (
+        _make_session_factory_patch(session_factory),
+        patch("app.services.orchestrator.wipe_patient_data", new_callable=AsyncMock) as mock_wipe,
+        patch("app.services.orchestrator.wipe_patients_by_id", new_callable=AsyncMock) as mock_scoped_wipe,
+        patch("app.services.orchestrator._get_cdr_auth_headers", new_callable=AsyncMock, return_value={}),
+        patch("app.services.orchestrator._get_cdr_url", new_callable=AsyncMock, return_value="http://cdr/fhir"),
+        patch.object(BatchQueryStrategy, "gather_patients", new_callable=AsyncMock, return_value=patients),
+        patch(
+            "app.services.orchestrator.build_submission_workflow",
+            new_callable=AsyncMock,
+            side_effect=FhirOperationError(
+                operation="read-measure",
+                url="http://mcs/Measure/measure-1",
+                status_code=404,
+                outcome=None,
+                latency_ms=1,
+            ),
+        ),
+    ):
+        await run_job(job_id)
+
+    mock_wipe.assert_not_awaited()
+    mock_scoped_wipe.assert_not_awaited()
+    async with session_factory() as session:
+        job = await session.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error_message is not None
+
+
+class _OrderRecordingStubWorkflow(_StubWorkflow):
+    """Stub that records when its post-wipe prerequisite hook runs."""
+
+    name = "order-stub"
+
+    def __init__(self, outcome, calls: list[str]):
+        super().__init__(outcome)
+        self._calls = calls
+
+    async def ensure_target_prerequisites(self) -> None:
+        self._calls.append("prereq")
+
+
+async def test_run_job_stages_prerequisites_after_the_wipe(test_session, session_factory):
+    """Regression: the workflow's prerequisite staging must run AFTER the wipe.
+
+    `wipe_patient_data`'s full-wipe list includes "Organization", and
+    `build_submission_workflow` runs BEFORE the wipe (deliberately, so a
+    canonical-fetch failure aborts without wiping). Staging the DEQM reporter
+    Organization at build time therefore had it deleted moments later, leaving
+    every MeasureReport in the job pointing at a reporter that no longer
+    existed. Since $submit-data is transaction-backed, a dangling reference
+    fails that patient's entire submission.
+
+    Only bites when mcs_wipe_before_job is set, which is why this pins the
+    ordering rather than the symptom.
+    """
+    job_id = await _setup_job(test_session)
+    calls: list[str] = []
+    async with session_factory() as session:
+        job = await session.get(Job, job_id)
+        job.workflow = "deqm_submit_data"
+        job.mcs_wipe_before_job = True  # full wipe -> deletes Organization
+        await session.commit()
+
+    patients = [{"resourceType": "Patient", "id": "p1", "name": [{"family": "Test"}]}]
+    stub = _OrderRecordingStubWorkflow(GatherResult(resources=[{"resourceType": "Patient", "id": "p1"}]), calls)
+
+    with contextlib.ExitStack() as stack:
+        for p in _run_job_patches(session_factory, patients, stub):
+            stack.enter_context(p)
+        # Re-patch the full wipe so it records its own ordering.
+        stack.enter_context(
+            patch(
+                "app.services.orchestrator.wipe_patient_data",
+                new=AsyncMock(side_effect=lambda *a, **k: calls.append("wipe")),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "app.services.orchestrator.evaluate_measure",
+                new_callable=AsyncMock,
+                return_value={"resourceType": "MeasureReport", "group": []},
+            )
+        )
+        await run_job(job_id)
+
+    assert calls == ["wipe", "prereq"], (
+        f"expected the wipe to precede prerequisite staging, got {calls}. "
+        "Staging before the wipe means the full wipe deletes the DEQM reporter Organization."
+    )
