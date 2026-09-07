@@ -15,6 +15,7 @@ function Probe() {
       <span data-testid="mcs-name">{mcs.name}</span>
       <span data-testid="mcs-state">{mcs.state}</span>
       <span data-testid="mcs-readonly">{String(mcs.isReadOnly)}</span>
+      <span data-testid="cdr-id">{String(cdr.id)}</span>
       <span data-testid="cdr-name">{cdr.name}</span>
       <button onClick={refresh}>refresh</button>
     </div>
@@ -102,5 +103,45 @@ describe('ConnectionContext — provider exposes mcs/cdr identity from health (#
     await userEvent.click(screen.getByRole('button', { name: 'refresh' }));
     await waitFor(() => expect(api.getHealth).toHaveBeenCalledTimes(2));
     expect(screen.getByTestId('mcs-readonly')).toHaveTextContent('true');
+  });
+});
+
+describe('ConnectionContext — cdr identity from health (#404)', () => {
+  test('surfaces cdr.id from GET /health so effects can key on the active CDR', async () => {
+    api.getHealth = jest.fn().mockResolvedValue({
+      cdr: { status: 'healthy', name: 'Attendee CDR', id: 'cdr-7', is_read_only: false },
+      measure_engine: { status: 'healthy', name: 'Local MCS', id: 'mcs-2' },
+    });
+
+    render(
+      <ConnectionProvider>
+        <Probe />
+      </ConnectionProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId('cdr-id')).toHaveTextContent('cdr-7'));
+    expect(screen.getByTestId('cdr-name')).toHaveTextContent('Attendee CDR');
+  });
+
+  test('a network error clears cdr.id to null rather than leaving a stale one', async () => {
+    api.getHealth = jest
+      .fn()
+      .mockResolvedValueOnce({
+        cdr: { status: 'healthy', name: 'Attendee CDR', id: 'cdr-7' },
+        measure_engine: { status: 'healthy', name: 'Local MCS', id: 'mcs-2' },
+      })
+      .mockRejectedValue(new Error('network down'));
+
+    render(
+      <ConnectionProvider>
+        <Probe />
+      </ConnectionProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId('cdr-id')).toHaveTextContent('cdr-7'));
+
+    await userEvent.click(screen.getByText('refresh'));
+
+    await waitFor(() => expect(screen.getByTestId('cdr-id')).toHaveTextContent('null'));
   });
 });

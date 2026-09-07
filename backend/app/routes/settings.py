@@ -244,6 +244,10 @@ async def probe_mcs_connection(
 _ADMIN_DEFAULTS: dict[str, str] = {
     "validation_enabled": "false",
     "comparison_enabled": "false",
+    # Gates ONLY `POST /api/groups/<id>/$evaluate`, which is parked with no UI.
+    # It no longer gates Group *listing*: since #404 that is the always-on
+    # Patients module, because a participant surveying an unfamiliar CDR must
+    # not have to find an admin flag before they can see its cohorts.
     "groups_enabled": "false",
 }
 

@@ -94,3 +94,72 @@ def test_synthesized_groups_not_on_measure_engine(measure_url: str) -> None:
     measure_groups = _fetch_all_groups(measure_url)
     leaked = synthesized_ids & set(measure_groups)
     assert not leaked, f"Synthesized Groups unexpectedly present on measure engine: {sorted(leaked)}"
+
+
+# ---------------------------------------------------------------------------
+# The Patients module reads these same Groups through GET /api/groups (#404).
+#
+# NOTE: this file is in CI's --ignore list, so CI will silently skip everything
+# below. It must be run locally (pre-push checklist step 5):
+#     ./scripts/run-integration-tests.sh tests/integration/test_groups_dropdown.py
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_api_groups_returns_every_seeded_group_unfiltered(integration_client, cdr_url: str) -> None:
+    """GET /api/groups must expose all 7 seeded Groups, not only CQL-evaluatable ones.
+
+    The seeded connectathon Groups are synthesized and carry no CQL
+    valueExpression, so under the pre-#404 CQL-filtered lister this endpoint
+    returned an empty list — the exact opposite of what a participant
+    surveying a CDR needs.
+    """
+    with open(_MANIFEST) as f:
+        manifest = json.load(f)
+    expected_ids = {m["id"] for m in manifest["measures"]}
+
+    resp = await integration_client.get("/api/groups")
+    assert resp.status_code == 200, resp.text
+
+    returned = {g["id"] for g in resp.json()["groups"]}
+    missing = expected_ids - returned
+    assert not missing, f"GET /api/groups omitted seeded Groups: {sorted(missing)}"
+
+    # And the payload carries what the Patients rows render.
+    sample = next(g for g in resp.json()["groups"] if g["id"] in expected_ids)
+    assert set(sample) >= {"id", "name", "type", "member_count", "quantity"}
+
+
+@pytest.mark.asyncio
+async def test_api_groups_follows_the_active_cdr(integration_client, db_session, measure_url: str) -> None:
+    """Activating a different CDR changes what GET /api/groups returns.
+
+    Criterion (b): run a measure against the Groups on the CDR you are actually
+    pointed at. The measure engine deliberately holds none of the synthesized
+    Groups (asserted above), so activating it as the CDR must yield a list that
+    no longer contains them — proving the endpoint follows the active row
+    rather than a process-wide default.
+    """
+    from sqlalchemy import update as sa_update
+
+    from app.models.config import AuthType, CDRConfig
+
+    before = {g["id"] for g in (await integration_client.get("/api/groups")).json()["groups"]}
+    assert before, "precondition: the seeded CDR should expose Groups"
+
+    # Point the active CDR at the measure engine, which has no synthesized Groups.
+    await db_session.execute(sa_update(CDRConfig).values(is_active=False))
+    db_session.add(
+        CDRConfig(
+            name="Groupless CDR",
+            cdr_url=measure_url,
+            auth_type=AuthType.none,
+            is_active=True,
+            is_default=False,
+            is_read_only=False,
+        )
+    )
+    await db_session.commit()
+
+    after = {g["id"] for g in (await integration_client.get("/api/groups")).json()["groups"]}
+    assert not (before & after), f"GET /api/groups still returned the previous CDR's Groups: {sorted(before & after)}"

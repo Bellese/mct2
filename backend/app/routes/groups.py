@@ -1,9 +1,15 @@
-"""Experimental Groups endpoints (issue #322).
+"""CDR Group endpoints — the Patients module (issues #322, #404).
 
-Lists CQL-evaluatable Groups on the active CDR and invokes
-`Group/<id>/$evaluate`. Architecturally independent from the Measure pipeline:
-this module imports nothing from `app.orchestrator`, `app.routes.jobs`,
-`app.routes.measures`, `app.routes.results`, or measure/job state modules.
+`GET /api/groups` lists every Group on the active CDR, unfiltered and always
+on: it is what answers "what patient cohorts exist on this server?" for a
+participant pointing Lenny at a CDR it has never seen.
+
+`POST /api/groups/<id>/$evaluate` remains gated behind the `groups_enabled`
+admin setting — it has no v1 UI and is retained for the v2 member listing.
+
+Architecturally independent from the Measure pipeline: this module imports
+nothing from `app.orchestrator`, `app.routes.jobs`, `app.routes.measures`,
+`app.routes.results`, or measure/job state modules.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from app.services.fhir_client import (
     GroupEvaluateError,
     _build_auth_headers,
     evaluate_group_and_resolve_members,
-    list_groups_with_expression,
+    list_groups,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,15 +47,19 @@ async def _require_feature_enabled(session: AsyncSession) -> None:
 
 @router.get("")
 async def list_groups_endpoint(
-    session: AsyncSession = Depends(get_session),
     cdr: ConnectionContext = Depends(get_active_cdr),
 ) -> dict:
-    await _require_feature_enabled(session)
+    """List every Group on the active CDR.
+
+    Deliberately unfiltered and ungated: the Patients module exists to survey
+    an unfamiliar CDR, so hiding the Groups without a CQL expression would hide
+    exactly what the participant came to look at (#404).
+    """
     auth_headers = await _build_auth_headers(cdr.auth_type, cdr.auth_credentials)
     try:
-        groups = await list_groups_with_expression(cdr.cdr_url, auth_headers)
+        groups = await list_groups(cdr.cdr_url, auth_headers)
     except Exception:
-        logger.exception("Failed to list groups for $evaluate page")
+        logger.exception("Failed to list groups for the Patients module")
         raise HTTPException(
             status_code=502,
             detail="Cannot reach CDR to list groups. Check CDR connectivity in Settings.",

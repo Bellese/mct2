@@ -62,7 +62,7 @@ export default function JobsPage() {
   const pollRef = useRef(null);
   const toast = useToast();
   const { query } = useSearch();
-  const { mcs } = useConnection();
+  const { mcs, cdr } = useConnection();
 
   const loadJobs = useCallback(async () => {
     try {
@@ -106,10 +106,14 @@ export default function JobsPage() {
     loadJobs();
     loadMeasures();
     loadGroups();
-    // mcs.id: re-fetch whenever the active MCS changes (#396), so activating
-    // a different measure engine in Settings refreshes the measure/group list
-    // this page's "New calculation" form is built from.
-  }, [loadJobs, loadMeasures, loadGroups, mcs.id]);
+    // The two lists this page's "New calculation" form is built from come
+    // from different servers, so each follows its own connection:
+    //   mcs.id — loadMeasures, the measure list (#396)
+    //   cdr.id — loadGroups, the patient-group list (#404)
+    // Without cdr.id, activating a different CDR left the previous CDR's
+    // Groups on offer and the submitted job targeted a Group id that does
+    // not exist on the newly activated server.
+  }, [loadJobs, loadMeasures, loadGroups, mcs.id, cdr.id]);
 
   useEffect(() => {
     // Before the first fetch resolves there's nothing to reconcile against —

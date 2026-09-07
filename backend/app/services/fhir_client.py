@@ -1716,6 +1716,12 @@ async def list_groups(
                             "name": resource.get("name"),
                             "type": resource.get("type"),
                             "member_count": len(resource.get("member", [])),
+                            # A FHIR Group may express its size via `quantity`
+                            # instead of an enumerated `member` array (e.g. a
+                            # characteristic-based cohort). Surfaced so the
+                            # Patients module can avoid reporting a real cohort
+                            # as "0 members" (#404).
+                            "quantity": resource.get("quantity"),
                         }
                     )
             url = None

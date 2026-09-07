@@ -44,7 +44,7 @@ function AppShell() {
     return 'light';
   });
   const [query, setQuery] = useState('');
-  const [features, setFeatures] = useState({ validation: false, groups: false });
+  const [features, setFeatures] = useState({ validation: false });
   const searchRef = useRef(null);
 
   useEffect(() => {
@@ -62,15 +62,9 @@ function AppShell() {
 
   useEffect(() => {
     getAdminSettings()
-      .then(s => setFeatures({
-        validation: s.validation_enabled ?? false,
-        groups: s.groups_enabled ?? false,
-      }))
+      .then(s => setFeatures({ validation: s.validation_enabled ?? false }))
       .catch(() => {});
-    const h = (e) => setFeatures({
-      validation: e.detail.validation_enabled ?? false,
-      groups: e.detail.groups_enabled ?? false,
-    });
+    const h = (e) => setFeatures({ validation: e.detail.validation_enabled ?? false });
     window.addEventListener('admin-settings-changed', h);
     return () => window.removeEventListener('admin-settings-changed', h);
   }, []);

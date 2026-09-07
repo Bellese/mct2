@@ -1,10 +1,10 @@
 import MeasuresPage from './pages/MeasuresPage';
 import JobsPage from './pages/JobsPage';
-import GroupsPage from './pages/GroupsPage';
+import PatientsPage from './pages/PatientsPage';
 import ResultsPage from './pages/ResultsPage';
 import SettingsPage from './pages/SettingsPage';
 import ValidationPage from './pages/ValidationPage';
-import { MeasuresIcon, JobsIcon, ResultsIcon, ValidateIcon } from './components/Icons';
+import { MeasuresIcon, JobsIcon, PatientsIcon, ResultsIcon, ValidateIcon } from './components/Icons';
 
 // Single source of truth for every route in the app: the <Route> table, the
 // sidebar nav + keyboard shortcuts, the header title, the search placeholder,
@@ -12,7 +12,7 @@ import { MeasuresIcon, JobsIcon, ResultsIcon, ValidateIcon } from './components/
 // production `serve` SPA rewrite list. Adding a page means adding one entry
 // here — not touching five separate places (see #383, #384).
 //
-// Note: pages must not import this module — GroupsPage etc. are imported
+// Note: pages must not import this module — PatientsPage etc. are imported
 // *by* routes.js, so the reverse would be circular.
 //
 // Field semantics:
@@ -21,7 +21,7 @@ import { MeasuresIcon, JobsIcon, ResultsIcon, ValidateIcon } from './components/
 //   keyboard shortcut (`kbd`). Omitted for `/settings` (rendered separately,
 //   with its own styling and no shortcut) and for `/results/:jobId`.
 // - `feature`: gates the *nav entry + keyboard shortcut* only. The <Route>
-//   itself is always registered; the page component (e.g. GroupsPage) is
+//   itself is always registered; the page component (e.g. ValidationPage) is
 //   responsible for redirecting away if its own feature flag is off.
 // - `title` / `searchPlaceholder`: looked up by basePath ('/' + first path
 //   segment), which is why `/results/:jobId` omits them and resolves through
@@ -43,13 +43,15 @@ export const ROUTES = [
     nav: { label: 'Jobs', Icon: JobsIcon, kbd: 'J' },
   },
   {
-    path: '/groups',
-    Component: GroupsPage,
-    title: 'Groups',
-    searchPlaceholder: 'Search groups…',
-    nav: { label: 'Groups', Icon: JobsIcon, kbd: 'G' },
-    feature: 'groups',
+    path: '/patients',
+    Component: PatientsPage,
+    title: 'Patients',
+    searchPlaceholder: 'Search patient groups…',
+    nav: { label: 'Patients', Icon: PatientsIcon, kbd: 'P' },
   },
+  // The module shipped as /groups while it was flag-gated (#322); keep the old
+  // path working for anyone who bookmarked it.
+  { path: '/groups', redirectTo: '/patients' },
   {
     path: '/results',
     Component: ResultsPage,

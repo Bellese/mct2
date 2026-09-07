@@ -115,10 +115,16 @@ async def health_check(
             resp = await client.get(cdr_url)
             latency_ms = round((time.monotonic() - t0) * 1000)
             if resp.status_code == 200:
-                status["cdr"] = {"status": "connected", "name": cdr.name, "is_read_only": cdr.is_read_only}
+                status["cdr"] = {
+                    "status": "connected",
+                    "id": cdr.id,
+                    "name": cdr.name,
+                    "is_read_only": cdr.is_read_only,
+                }
             else:
                 status["cdr"] = {
                     "status": "disconnected",
+                    "id": cdr.id,
                     "name": cdr.name,
                     "is_read_only": cdr.is_read_only,
                     "error": f"HTTP {resp.status_code}",
@@ -129,6 +135,7 @@ async def health_check(
         latency_ms = round((time.monotonic() - t0) * 1000)
         status["cdr"] = {
             "status": "disconnected",
+            "id": cdr.id,
             "name": cdr.name,
             "is_read_only": cdr.is_read_only,
             "error": sanitize_error(exc)[:200],
