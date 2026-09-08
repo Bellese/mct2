@@ -1,5 +1,6 @@
 """End-to-end test: deqm_submit_data workflow against real HAPI (base-fallback path)."""
 
+import os
 from contextlib import ExitStack
 from unittest.mock import patch
 
@@ -13,6 +14,34 @@ from tests.integration.conftest import TEST_CDR_URL, TEST_MEASURE_URL
 
 pytestmark = pytest.mark.integration
 
+
+@pytest.fixture(scope="module", autouse=True)
+def _require_prebaked_stack():
+    """Skip this module unless the prebaked HAPI images are in use.
+
+    Two independent reasons, both pre-existing in spirit:
+
+    - The vanilla seed (`seed/measure-bundle.json`) carries only CMS122, so the
+      CMS130 parametrisation below has never been able to run without prebaked
+      images -- it fails with "Measure does not exist on the active measure
+      calculation server". This module was already prebaked-only in practice; it
+      just failed confusingly instead of skipping.
+    - The jobs here are now scoped to each measure's Group (see `_create_and_run`)
+      and the vanilla seed contains no Group resources at all, so those jobs would
+      404. `test_full_jobs_pipeline.py` carries this same guard for exactly this
+      reason.
+
+    Skipping loudly beats a 404 that reads like a product bug.
+    """
+    if os.environ.get("HAPI_PREBAKED") != "1":
+        pytest.skip(
+            "test_deqm_submit_data_workflow requires HAPI_PREBAKED=1 (prebaked images "
+            "carry the connectathon measures and their Groups). Run via: "
+            "USE_PREBAKED=1 ./scripts/run-integration-tests.sh "
+            "tests/integration/test_deqm_submit_data_workflow.py"
+        )
+
+
 MEASURE_ID = "CMS122FHIRDiabetesAssessGreaterThan9Percent"
 DEFAULT_PERIOD = ("2025-01-01", "2025-12-31")
 
@@ -24,6 +53,10 @@ DEFAULT_PERIOD = ("2025-01-01", "2025-12-31")
 # as happily with the bug present as without it.
 EXCLUSION_MEASURE_ID = "CMS130FHIRColorectalCancerScreening"
 EXCLUSION_PERIOD = ("2026-01-01", "2026-12-31")
+# The patient carrying that hospice ServiceRequest. Asserted present in the
+# CMS130 results below so that scoping the job to a Group can never quietly
+# drop the one patient this parametrisation exists to cover.
+EXCLUSION_PATIENT_ID = "b70f2fc0-3254-4240-af70-793cd1bc90b2"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -80,6 +113,14 @@ def _warm_hapi_search_parameters():
             continue
 
 
+async def _group_member_count(group_id: str) -> int:
+    """Members enumerated on the CDR's synthesized Group for this measure."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"{TEST_CDR_URL}/Group/{group_id}")
+        resp.raise_for_status()
+        return len(resp.json().get("member", []))
+
+
 def _run_patches(integration_session_factory):
     return (
         patch("app.config.settings.MEASURE_ENGINE_URL", TEST_MEASURE_URL),
@@ -108,6 +149,17 @@ async def _create_and_run(
     measure_id: str = MEASURE_ID,
     period: tuple[str, str] = DEFAULT_PERIOD,
 ) -> dict:
+    # group_id, not an unscoped job. Without it `run_job` falls through to
+    # BatchQueryStrategy and evaluates the ENTIRE 319-patient CDR against one
+    # measure -- ~260 of those patients come from other measures' bundles and
+    # contribute nothing but runtime. `seed/load_seed_data.py` synthesizes one
+    # Group per bundle with `Group.id == measure_id`, so the measure's own
+    # cohort is addressable by the measure id itself.
+    #
+    # This is what made the Integration job exceed its CI ceiling (#418): five
+    # full-panel jobs in this file were 1,595 patient evaluations where 296 do
+    # the same work. Parity is unaffected -- both sides of the comparison run
+    # the identical scoped panel.
     resp = await integration_client.post(
         "/jobs",
         json={
@@ -115,6 +167,7 @@ async def _create_and_run(
             "period_start": period[0],
             "period_end": period[1],
             "cdr_url": TEST_CDR_URL,
+            "group_id": measure_id,
             "workflow": workflow,
         },
     )
@@ -179,6 +232,24 @@ async def test_deqm_job_matches_direct_load_populations(
     assert direct["failed_patients"] == 0, f"direct_load job had failed patients: {direct.get('error_message')}"
     assert deqm["failed_patients"] == 0, "DEQM job had failed patients"
 
+    # Scoping to a Group (see _create_and_run) is a runtime optimisation, and the
+    # way an optimisation like this goes wrong is silently: a Group that lost its
+    # members would still pass every assertion below, on a panel of nothing. Pin
+    # the panel to the Group the seed actually built.
+    expected_panel = await _group_member_count(measure_id)
+    assert direct["total_patients"] == expected_panel, (
+        f"direct_load evaluated {direct['total_patients']} patients, Group has {expected_panel}"
+    )
+    assert deqm["total_patients"] == expected_panel, (
+        f"deqm evaluated {deqm['total_patients']} patients, Group has {expected_panel}"
+    )
+    # _run_patches pins BATCH_SIZE=25 specifically so submission runs concurrently
+    # across multiple batches; a panel that fits in one batch silently retires that
+    # coverage rather than failing. Assert the property instead of assuming it.
+    assert deqm["total_batches"] > 1, (
+        f"panel of {expected_panel} fits in one batch -- concurrent submission is no longer exercised"
+    )
+
     async with integration_session_factory() as session:
         rows_direct = (
             (await session.execute(select(MeasureResult).where(MeasureResult.job_id == direct["id"]))).scalars().all()
@@ -196,6 +267,16 @@ async def test_deqm_job_matches_direct_load_populations(
     assert set(pops_deqm) == set(pops_direct)
     for pid, pops in pops_direct.items():
         assert pops_deqm[pid] == pops, f"Population mismatch for {pid}"
+
+    # The whole point of the CMS130 parametrisation is one patient: the hospice
+    # ServiceRequest behind a ValueSet the CDR cannot resolve. Group-scoping keeps
+    # them (they are in CMS130's own bundle), but "keeps them" is exactly the kind
+    # of claim that should be checked rather than reasoned about.
+    if measure_id == EXCLUSION_MEASURE_ID:
+        assert EXCLUSION_PATIENT_ID in pops_direct, (
+            f"exclusion patient {EXCLUSION_PATIENT_ID} absent from the scoped panel -- "
+            "this parametrisation no longer covers the ValueSet under-fetch it was written for"
+        )
 
 
 async def test_deqm_submission_stored_on_mcs(integration_client, integration_session_factory):
